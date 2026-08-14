@@ -259,7 +259,8 @@ export class GraphRouterService {
       maxGrade = Math.max(maxGrade, Math.abs(stepGrade));
       totalGradeSum += Math.abs(stepGrade);
 
-      const energyCalc = this.physicsService.calculateSegmentEnergy(stepDist, stepGrade, 22);
+      const cruisingSpeed = profile === 'turbo' ? 30 : profile === 'safe' ? 22 : 26;
+      const energyCalc = this.physicsService.calculateSegmentEnergy(stepDist, stepGrade, cruisingSpeed);
       totalDuration += energyCalc.durationSeconds;
       totalEnergyWh += energyCalc.energyWh;
 

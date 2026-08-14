@@ -13,32 +13,32 @@ export const ASSIST_CONFIGS: Record<AssistLevel, AssistLevelConfig> = {
   ECO: {
     name: 'ECO',
     motorAssistRatio: 0.4, // 40% motor contribution
-    maxSpeedKmh: 25,
-    label: 'Eco (40%)',
+    maxSpeedKmh: 32, // Resolução CONTRAN 996/2023 (Brasil: até 32 km/h)
+    label: 'Eco (40% - 32 km/h)',
     color: '#10b981',
     badgeClass: 'badge-eco'
   },
   TOUR: {
     name: 'TOUR',
     motorAssistRatio: 1.0, // 100% motor match (1:1 with rider)
-    maxSpeedKmh: 25,
-    label: 'Tour (100%)',
+    maxSpeedKmh: 32,
+    label: 'Tour (100% - 32 km/h)',
     color: '#06b6d4',
     badgeClass: 'badge-tour'
   },
   SPORT: {
     name: 'SPORT',
     motorAssistRatio: 1.8, // 180% assist
-    maxSpeedKmh: 25,
-    label: 'Sport (180%)',
+    maxSpeedKmh: 32,
+    label: 'Sport (180% - 32 km/h)',
     color: '#f59e0b',
     badgeClass: 'badge-sport'
   },
   TURBO: {
     name: 'TURBO',
     motorAssistRatio: 3.0, // 300% assist (maximum punch for climbs)
-    maxSpeedKmh: 25,
-    label: 'Turbo (300%)',
+    maxSpeedKmh: 32,
+    label: 'Turbo (300% - 32 km/h)',
     color: '#ef4444',
     badgeClass: 'badge-turbo'
   }
@@ -57,7 +57,7 @@ export class EBikePhysicsService {
     currentBatteryWh: 560, // default ~90%
     bikeWeightKg: 24,
     riderWeightKg: 75,
-    motorMaxWatt: 250,
+    motorMaxWatt: 350, // Padrão Brasil CONTRAN (até 350W nominais / 500W pico)
     motorEfficiency: 0.82,
     regenerativeBraking: true,
     activeAssist: 'TOUR',
