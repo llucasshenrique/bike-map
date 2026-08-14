@@ -72,6 +72,8 @@ export interface RouteWaypoint {
 
 export interface RouteResult {
   id: string;
+  name?: string;
+  summary?: string;
   profile: RoutingProfile;
   totalDistanceMeters: number;
   totalDurationSeconds: number;

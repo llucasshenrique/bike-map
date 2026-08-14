@@ -25,6 +25,8 @@ export class NavigationService {
   ]);
 
   readonly activePickingWaypointIndex = signal<number | null>(null);
+  readonly availableRoutes = signal<RouteResult[]>([]);
+  readonly selectedRouteIndex = signal<number>(0);
   readonly activeRoute = signal<RouteResult | null>(null);
   readonly currentInstruction = signal<TurnInstruction | null>(null);
   readonly currentInstructionIndex = signal<number>(0);
@@ -186,11 +188,25 @@ export class NavigationService {
     else this.activePickingWaypointIndex.set(null);
   }
 
+  selectRoute(index: number): void {
+    const list = this.availableRoutes();
+    if (index >= 0 && index < list.length) {
+      this.selectedRouteIndex.set(index);
+      const chosen = list[index];
+      this.activeRoute.set(chosen);
+      if (chosen.instructions.length > 0) {
+        this.currentInstruction.set(chosen.instructions[0]);
+      }
+    }
+  }
+
   clearRoute(): void {
     this.waypoints.set([
       { id: 'wp_0', letter: 'A', label: 'Start Point (A)', point: null },
       { id: 'wp_1', letter: 'B', label: 'Destination (B)', point: null }
     ]);
+    this.availableRoutes.set([]);
+    this.selectedRouteIndex.set(0);
     this.activeRoute.set(null);
     this.currentInstruction.set(null);
     this.isNavigating.set(false);
@@ -198,7 +214,7 @@ export class NavigationService {
 
   setProfile(profile: RoutingProfile): void {
     this.selectedProfile.set(profile);
-    if (this.activeRoute() && this.hasEnoughValidPoints()) {
+    if (this.hasEnoughValidPoints()) {
       this.recomputePlan();
     }
   }
@@ -216,14 +232,17 @@ export class NavigationService {
 
     this.isCalculating.set(true);
     try {
-      const route = await this.router.calculateMultiStopRoute(points, this.selectedProfile());
-      if (route) {
-        this.activeRoute.set(route);
-        if (route.instructions.length > 0) {
-          this.currentInstruction.set(route.instructions[0]);
+      const routes = await this.router.calculateMultipleRoutes(points, this.selectedProfile());
+      this.availableRoutes.set(routes);
+      if (routes.length > 0) {
+        this.selectedRouteIndex.set(0);
+        this.activeRoute.set(routes[0]);
+        if (routes[0].instructions.length > 0) {
+          this.currentInstruction.set(routes[0].instructions[0]);
         }
+        return routes[0];
       }
-      return route;
+      return null;
     } finally {
       this.isCalculating.set(false);
     }

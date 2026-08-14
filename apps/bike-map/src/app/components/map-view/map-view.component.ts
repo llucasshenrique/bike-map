@@ -83,6 +83,19 @@ import { BikePOI } from '../../core/models/poi.types';
           </svg>
         </button>
       </div>
+
+      <!-- ELEVATION GRADE LEGEND (WHEN ROUTE IS ACTIVE) -->
+      @if (navService.activeRoute()) {
+        <div class="grade-legend-bar">
+          <div class="legend-title">SLOPE / GRADE:</div>
+          <div class="legend-items">
+            <span class="legend-pill" style="--color: #06b6d4;">🔵 Downhill</span>
+            <span class="legend-pill" style="--color: #10b981;">🟢 0-3% Flat</span>
+            <span class="legend-pill" style="--color: #f59e0b;">🟡 3-7% Mild</span>
+            <span class="legend-pill" style="--color: #ef4444;">🔴 >7% Climb</span>
+          </div>
+        </div>
+      }
     </div>
   `,
   styles: [`
@@ -212,10 +225,40 @@ import { BikePOI } from '../../core/models/poi.types';
       width: 20px;
       height: 20px;
     }
-    .action-circle-btn.gps-btn {
-      background: #38bdf8;
-      color: #0f172a;
-      border-color: #7dd3fc;
+    /* GRADE LEGEND BAR */
+    .grade-legend-bar {
+      position: absolute;
+      bottom: 24px;
+      left: 14px;
+      background: rgba(15, 23, 42, 0.9);
+      backdrop-filter: blur(14px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 6px 12px;
+      z-index: 900;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    }
+    .legend-title {
+      font-size: 0.58rem;
+      font-weight: 800;
+      color: #64748b;
+      letter-spacing: 0.06em;
+    }
+    .legend-items {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .legend-pill {
+      font-size: 0.68rem;
+      font-weight: 700;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      gap: 3px;
     }
 
     @keyframes dropDown {
@@ -564,31 +607,96 @@ export class MapViewComponent implements OnInit, OnDestroy {
 
   private renderRoute(route: RouteResult): void {
     this.routeLayerGroup.clearLayers();
-    if (route.coordinates.length < 2) return;
+    if (!this.map || route.coordinates.length < 2) return;
 
-    const latLngs = route.coordinates.map(p => [p.lat, p.lng] as L.LatLngTuple);
+    const availableRoutes = this.navService.availableRoutes();
+    const currentActiveIdx = this.navService.selectedRouteIndex();
 
-    // Outer glow casing
-    const casing = L.polyline(latLngs, {
+    // 1. Render alternative routes in background (clickable)
+    availableRoutes.forEach((altRoute, altIdx) => {
+      if (altIdx === currentActiveIdx) return; // Skip active route for now
+
+      const altLatLngs = altRoute.coordinates.map(p => [p.lat, p.lng] as L.LatLngTuple);
+      const altPolyline = L.polyline(altLatLngs, {
+        color: '#64748b',
+        weight: 5,
+        opacity: 0.6,
+        dashArray: '6, 8',
+        lineCap: 'round'
+      });
+
+      altPolyline.bindTooltip(
+        `<div style="font-family: sans-serif; font-size: 11px; font-weight: 700; color: #0f172a;">
+          ${altRoute.name || 'Alternative Route'} · ${(altRoute.totalDistanceMeters / 1000).toFixed(1)} km · ⚡ ${altRoute.totalEnergyWh} Wh<br>
+          <span style="color: #0284c7; font-size: 10px;">Tap to select this route</span>
+        </div>`,
+        { sticky: true }
+      );
+
+      altPolyline.on('click', () => {
+        this.navService.selectRoute(altIdx);
+      });
+
+      this.routeLayerGroup.addLayer(altPolyline);
+    });
+
+    // 2. Render Outer Glow Casing for Active Route
+    const activeLatLngs = route.coordinates.map(p => [p.lat, p.lng] as L.LatLngTuple);
+    const casing = L.polyline(activeLatLngs, {
       color: '#38bdf8',
-      weight: 9,
-      opacity: 0.4,
+      weight: 10,
+      opacity: 0.35,
       lineCap: 'round'
     });
-
-    // Inner bright active route
-    const mainRoute = L.polyline(latLngs, {
-      color: '#0284c7',
-      weight: 5,
-      opacity: 0.95,
-      lineCap: 'round'
-    });
-
     this.routeLayerGroup.addLayer(casing);
-    this.routeLayerGroup.addLayer(mainRoute);
+
+    // 3. Render Grade/Elevation-Colored Segments for Active Route
+    const getGradeColor = (grade: number): string => {
+      if (grade < 0) return '#06b6d4'; // Downhill (Regen)
+      if (grade <= 3) return '#10b981'; // 0-3% Flat/Gentle
+      if (grade <= 7) return '#f59e0b'; // 3-7% Moderate Slope
+      return '#ef4444'; // >7% Steep Climb
+    };
+
+    if (route.segments && route.segments.length > 0) {
+      route.segments.forEach(seg => {
+        if (!seg.coordinates || seg.coordinates.length < 2) return;
+        const segLatLngs = seg.coordinates.map(p => [p.lat, p.lng] as L.LatLngTuple);
+        const segColor = getGradeColor(seg.gradePercent);
+
+        const segLine = L.polyline(segLatLngs, {
+          color: segColor,
+          weight: 6,
+          opacity: 0.95,
+          lineCap: 'round',
+          lineJoin: 'round'
+        });
+
+        const slopeSign = seg.gradePercent > 0 ? '+' : '';
+        segLine.bindTooltip(
+          `<div style="font-family: sans-serif; font-size: 11px; color: #0f172a;">
+            <strong style="color: ${segColor};">${seg.name || 'Cycleway'}</strong><br>
+            Slope: <strong>${slopeSign}${seg.gradePercent}%</strong> · Distance: <strong>${seg.distanceMeters}m</strong><br>
+            Elevation Gain: <strong>+${seg.elevationGainM}m</strong> · Energy: <strong>${seg.estimatedEnergyWh} Wh</strong>
+          </div>`,
+          { sticky: true }
+        );
+
+        this.routeLayerGroup.addLayer(segLine);
+      });
+    } else {
+      // Fallback: Uniform bright route if segments unavailable
+      const mainRoute = L.polyline(activeLatLngs, {
+        color: '#0284c7',
+        weight: 6,
+        opacity: 0.95,
+        lineCap: 'round'
+      });
+      this.routeLayerGroup.addLayer(mainRoute);
+    }
 
     if (this.map && !this.navService.isNavigating()) {
-      this.focusOnCalculatedRoute(latLngs);
+      this.focusOnCalculatedRoute(activeLatLngs);
     }
   }
 

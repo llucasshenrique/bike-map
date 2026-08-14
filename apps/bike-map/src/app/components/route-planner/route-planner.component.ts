@@ -196,6 +196,37 @@ import { ElevationChartComponent } from '../elevation-chart/elevation-chart.comp
       <!-- ROUTE RESULT SUMMARY CARD -->
       @if (navService.activeRoute(); as route) {
         <div class="route-summary-card">
+          <!-- MULTI-ROUTE OPTIONS SELECTOR -->
+          @if (navService.availableRoutes().length > 1) {
+            <div class="route-options-container">
+              <div class="options-header">
+                <span>FOUND {{ navService.availableRoutes().length }} ROUTE OPTIONS:</span>
+              </div>
+              <div class="options-list">
+                @for (opt of navService.availableRoutes(); track opt.id; let optIdx = $index) {
+                  <div
+                    class="option-card"
+                    [class.is-selected]="navService.selectedRouteIndex() === optIdx"
+                    (click)="navService.selectRoute(optIdx)"
+                  >
+                    <div class="opt-top">
+                      <strong class="opt-name">{{ opt.name || 'Option ' + (optIdx + 1) }}</strong>
+                      <span class="opt-badge" [class.badge-active]="navService.selectedRouteIndex() === optIdx">
+                        {{ navService.selectedRouteIndex() === optIdx ? '✓ ACTIVE' : 'SELECT' }}
+                      </span>
+                    </div>
+                    <div class="opt-metrics">
+                      <span>📏 {{ formatDistance(opt.totalDistanceMeters) }}</span>
+                      <span>⏱️ {{ formatDuration(opt.totalDurationSeconds) }}</span>
+                      <span>⚡ -{{ opt.totalEnergyWh }} Wh</span>
+                      <span>▲ {{ opt.elevationGainM }}m</span>
+                    </div>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+
           <!-- Main Highlights -->
           <div class="summary-grid">
             <div class="sum-item">
@@ -679,6 +710,78 @@ import { ElevationChartComponent } from '../elevation-chart/elevation-chart.comp
       flex-direction: column;
       gap: 12px;
     }
+
+    /* MULTI-ROUTE OPTIONS CONTAINER */
+    .route-options-container {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 12px;
+      padding: 8px;
+    }
+    .options-header {
+      font-size: 0.6rem;
+      font-weight: 800;
+      color: #64748b;
+      letter-spacing: 0.05em;
+      margin-bottom: 2px;
+    }
+    .options-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .option-card {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+    .option-card:hover {
+      background: rgba(56, 189, 248, 0.08);
+      border-color: rgba(56, 189, 248, 0.3);
+    }
+    .option-card.is-selected {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: #38bdf8;
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.2);
+    }
+    .opt-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+    }
+    .opt-name {
+      font-size: 0.78rem;
+      color: #f8fafc;
+      font-weight: 700;
+    }
+    .opt-badge {
+      font-size: 0.58rem;
+      font-weight: 800;
+      color: #64748b;
+      background: rgba(255, 255, 255, 0.06);
+      padding: 2px 6px;
+      border-radius: 4px;
+      letter-spacing: 0.04em;
+    }
+    .opt-badge.badge-active {
+      background: #38bdf8;
+      color: #0f172a;
+    }
+    .opt-metrics {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 0.68rem;
+      color: #94a3b8;
+      font-weight: 600;
+    }
+
     .summary-grid {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
