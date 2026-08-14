@@ -588,8 +588,33 @@ export class MapViewComponent implements OnInit, OnDestroy {
     this.routeLayerGroup.addLayer(mainRoute);
 
     if (this.map && !this.navService.isNavigating()) {
-      this.map.fitBounds(latLngs, { padding: [60, 60], maxZoom: 16 });
+      this.focusOnCalculatedRoute(latLngs);
     }
+  }
+
+  private focusOnCalculatedRoute(latLngs: L.LatLngTuple[]): void {
+    if (!this.map || latLngs.length < 2) return;
+
+    const bounds = L.latLngBounds(latLngs);
+
+    // Also include any waypoints outside the path if present
+    for (const wp of this.navService.waypoints()) {
+      if (wp.point) {
+        bounds.extend([wp.point.lat, wp.point.lng]);
+      }
+    }
+
+    const isDesktop = window.innerWidth > 768;
+    const paddingTL: L.PointTuple = isDesktop ? [420, 40] : [20, 20];
+    const paddingBR: L.PointTuple = [40, 40];
+
+    this.map.flyToBounds(bounds, {
+      paddingTopLeft: paddingTL,
+      paddingBottomRight: paddingBR,
+      maxZoom: 16,
+      duration: 1.0,
+      easeLinearity: 0.25
+    });
   }
 
   toggleRangeCircle(): void {
@@ -607,8 +632,8 @@ export class MapViewComponent implements OnInit, OnDestroy {
     const route = this.navService.activeRoute();
     if (!route || !this.map || route.coordinates.length < 2) return;
 
-    const bounds = L.latLngBounds(route.coordinates.map(p => [p.lat, p.lng] as L.LatLngTuple));
-    this.map.fitBounds(bounds, { padding: [60, 60], maxZoom: 16 });
+    const latLngs = route.coordinates.map(p => [p.lat, p.lng] as L.LatLngTuple);
+    this.focusOnCalculatedRoute(latLngs);
   }
 
   recenterOnRider(): void {
