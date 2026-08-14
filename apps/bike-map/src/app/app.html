@@ -1,0 +1,39 @@
+<div class="app-root-container">
+  <!-- LEAFLET MAP VIEWPORT -->
+  <app-map-view
+    #mapView
+    (openNetworkSelector)="openNetworkModal()"
+    (openTelemetry)="openTelemetryModal()"
+  />
+
+  <!-- ROUTE PLANNER DRAWER / MODAL -->
+  @if (!navService.isNavigating() && showPlanner()) {
+    <app-route-planner (close)="togglePlanner()" />
+  }
+
+  <!-- FLOATING PLAN ROUTE BUTTON (When Planner is closed & not navigating) -->
+  @if (!navService.isNavigating() && !showPlanner()) {
+    <button class="fab-plan-btn" (click)="togglePlanner()">
+      <span class="fab-icon">⚡</span>
+      <span class="fab-label">PLAN E-BIKE ROUTE</span>
+    </button>
+  }
+
+  <!-- LIVE NAVIGATION HEADS-UP DISPLAY -->
+  @if (navService.isNavigating()) {
+    <app-navigation-hud (closeRequested)="showPlanner.set(true)" />
+  }
+
+  <!-- FULL COCKPIT TELEMETRY MODAL -->
+  @if (showTelemetry()) {
+    <app-ebike-telemetry (close)="closeTelemetryModal()" />
+  }
+
+  <!-- OFFLINE NETWORK SELECTOR MODAL -->
+  @if (showNetworkSelector()) {
+    <app-network-selector
+      (close)="closeNetworkModal()"
+      (networkChanged)="mapView.switchNetwork($event); closeNetworkModal()"
+    />
+  }
+</div>

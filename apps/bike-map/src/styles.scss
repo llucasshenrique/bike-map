@@ -1,0 +1,101 @@
+@import 'leaflet/dist/leaflet.css';
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700;800&display=swap');
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+html, body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background-color: #0f172a;
+  color: #f8fafc;
+  font-family: 'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom Leaflet Dark Marker and Rider Pulse */
+.rider-marker-pulse {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.rider-marker-pulse::after {
+  content: '';
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: rgba(56, 189, 248, 0.4);
+  animation: riderPulseRing 1.8s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+}
+
+.rider-inner-dot {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: #38bdf8;
+  border: 2.5px solid #ffffff;
+  box-shadow: 0 0 14px rgba(56, 189, 248, 0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #0f172a;
+  z-index: 2;
+  transition: transform 0.2s ease;
+}
+
+.rider-inner-dot svg {
+  width: 12px;
+  height: 12px;
+}
+
+@keyframes riderPulseRing {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+}
+
+/* Custom Leaflet Popups */
+.leaflet-popup-content-wrapper {
+  background: rgba(15, 23, 42, 0.95) !important;
+  backdrop-filter: blur(12px);
+  color: #f8fafc !important;
+  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+  border-radius: 12px !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6) !important;
+}
+
+.leaflet-popup-tip {
+  background: #0f172a !important;
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}

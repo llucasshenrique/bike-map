@@ -1,0 +1,37 @@
+.app-root-container {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.fab-plan-btn {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #10b981;
+  color: #0f172a;
+  border: none;
+  padding: 14px 24px;
+  border-radius: 30px;
+  font-size: 0.92rem;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  box-shadow: 0 8px 30px rgba(16, 185, 129, 0.45);
+  cursor: pointer;
+  z-index: 800;
+  letter-spacing: 0.05em;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.fab-plan-btn:hover {
+  transform: translateX(-50%) scale(1.04);
+  box-shadow: 0 10px 36px rgba(16, 185, 129, 0.6);
+}
+
+.fab-icon {
+  font-size: 1.2rem;
+}
