@@ -2,12 +2,13 @@
   position: relative;
   width: 100vw;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
 .fab-plan-btn {
   position: absolute;
-  bottom: 24px;
+  bottom: calc(28px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
   background: #10b981;
@@ -25,6 +26,11 @@
   z-index: 800;
   letter-spacing: 0.05em;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
+  white-space: nowrap;
+
+  @media (max-width: 768px) {
+    bottom: calc(34px + env(safe-area-inset-bottom, 0px));
+  }
 }
 
 .fab-plan-btn:hover {

@@ -10,6 +10,9 @@ import { RouteResult, RouteWaypoint } from '../../core/models/routing.types';
 import { GeoPoint } from '../../core/models/geo.types';
 import { BikePOI } from '../../core/models/poi.types';
 
+import { GeocodingService } from '../../core/services/geocoding.service';
+import { StorageService } from '../../core/services/storage.service';
+
 @Component({
   selector: 'app-map-view',
   standalone: true,
@@ -39,235 +42,240 @@ import { BikePOI } from '../../core/models/poi.types';
       <div class="floating-controls-top-right">
         <!-- Range Circle Toggle -->
         <button
-          class="map-btn"
+          class="map-pill-btn range-btn"
           [class.active]="showRangeCircle"
           (click)="toggleRangeCircle()"
-          title="Toggle Battery Reachability Circle"
+          title="Toggle E-Bike Battery Reachability Range"
         >
-          <span class="btn-icon">⚡</span>
-          <span class="btn-text">{{ physicsService.batteryTelemetry().estimatedRangeKm }} km</span>
+          <span class="pill-icon">⚡</span>
+          <span class="pill-label">{{ physicsService.batteryTelemetry().estimatedRangeKm }} km</span>
         </button>
 
-        <!-- Network Switcher -->
-        <button class="map-btn" (click)="openNetworkSelector.emit()" title="Switch Offline Bike Network">
-          <span class="btn-icon">🗺️</span>
-          <span class="btn-text">Trails</span>
+        <!-- Network / Offline Regions -->
+        <button
+          class="map-pill-btn"
+          (click)="openNetworkSelector.emit()"
+          title="Select Region or Download Offline Map"
+        >
+          <span class="pill-icon">🗺️</span>
+          <span class="pill-label">Trails</span>
         </button>
 
-        <!-- Bike Cockpit HUD -->
-        <button class="map-btn" (click)="openTelemetry.emit()" title="E-Bike Cockpit Computer">
-          <span class="btn-icon">🚲</span>
-          <span class="btn-text">Cockpit</span>
+        <!-- Fullscreen Cockpit Dashboard -->
+        <button
+          class="map-pill-btn"
+          (click)="openTelemetry.emit()"
+          title="Open Cockpit HUD"
+        >
+          <span class="pill-icon">🚲</span>
+          <span class="pill-label">Cockpit</span>
         </button>
       </div>
 
-      <!-- MAP BOTTOM RIGHT CONTROLS -->
-      <div class="floating-controls-bottom-right">
-        <!-- Fit Route -->
+      <!-- BOTTOM RIGHT MAP CONTROLS (ALWAYS FLOATING VISIBLE ABOVE DRAWER) -->
+      <div
+        class="floating-controls-bottom-right"
+        [class.drawer-collapsed]="navService.isPlannerOpen() && navService.isPlannerCollapsed()"
+        [class.drawer-expanded]="navService.isPlannerOpen() && !navService.isPlannerCollapsed()"
+      >
+        <!-- Recenter on Rider / Current Location -->
+        <button class="map-action-fab" (click)="recenterOnRider()" title="Recenter to My Location">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="fab-icon">
+            <circle cx="12" cy="12" r="7"/>
+            <polyline points="12 2 12 5"/>
+            <polyline points="12 19 12 22"/>
+            <polyline points="2 12 5 12"/>
+            <polyline points="19 12 22 12"/>
+            <circle cx="12" cy="12" r="2" fill="currentColor"/>
+          </svg>
+        </button>
+
+        <!-- Fit Entire Route Bounds -->
         @if (navService.activeRoute()) {
-          <button class="action-circle-btn" (click)="fitToRoute()" title="Fit Route to Screen">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+          <button class="map-action-fab" (click)="fitToRoute()" title="Fit Active Route in Screen">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" class="fab-icon">
+              <polyline points="15 3 21 3 21 9"/>
+              <polyline points="9 21 3 21 3 15"/>
+              <line x1="21" y1="3" x2="14" y2="10"/>
+              <line x1="3" y1="21" x2="10" y2="14"/>
             </svg>
           </button>
         }
-
-        <!-- Recenter GPS -->
-        <button class="action-circle-btn gps-btn" (click)="recenterOnRider()" title="Recenter GPS Position">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <circle cx="12" cy="12" r="8"/>
-            <line x1="12" y1="2" x2="12" y2="6"/>
-            <line x1="12" y1="18" x2="12" y2="22"/>
-            <line x1="2" y1="12" x2="6" y2="12"/>
-            <line x1="18" y1="12" x2="22" y2="12"/>
-          </svg>
-        </button>
       </div>
-
-      <!-- ELEVATION GRADE LEGEND (WHEN ROUTE IS ACTIVE) -->
-      @if (navService.activeRoute()) {
-        <div class="grade-legend-bar">
-          <div class="legend-title">SLOPE / GRADE:</div>
-          <div class="legend-items">
-            <span class="legend-pill" style="--color: #06b6d4;">🔵 Downhill</span>
-            <span class="legend-pill" style="--color: #10b981;">🟢 0-3% Flat</span>
-            <span class="legend-pill" style="--color: #f59e0b;">🟡 3-7% Mild</span>
-            <span class="legend-pill" style="--color: #ef4444;">🔴 >7% Climb</span>
-          </div>
-        </div>
-      }
     </div>
   `,
   styles: [`
     .map-container-wrapper {
       position: relative;
-      width: 100vw;
-      height: 100vh;
+      width: 100%;
+      height: 100%;
       overflow: hidden;
       background: #0b1120;
     }
+
     .leaflet-map-element {
       width: 100%;
       height: 100%;
       z-index: 1;
     }
-    .crosshair-cursor {
+
+    .leaflet-map-element.crosshair-cursor {
       cursor: crosshair !important;
     }
 
-    /* PICKING MODE BANNER */
-    .picking-mode-banner {
-      position: absolute;
-      top: 18px;
-      left: 50%;
-      transform: translateX(-50%);
-      background: rgba(15, 23, 42, 0.95);
-      backdrop-filter: blur(16px);
-      border: 1.5px solid #38bdf8;
-      border-radius: 30px;
-      padding: 8px 16px;
-      display: flex;
-      align-items: center;
-      gap: 14px;
-      z-index: 1100;
-      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.7);
-      animation: dropDown 0.3s ease;
-    }
-    .banner-badge {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 0.85rem;
-      font-weight: 700;
-      color: #f8fafc;
-    }
-    .picking-pulse {
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: #38bdf8;
-      box-shadow: 0 0 12px #38bdf8;
-      animation: pulse 1s infinite;
-    }
-    .banner-cancel-btn {
-      background: rgba(255, 255, 255, 0.15);
-      border: none;
-      color: #cbd5e1;
-      padding: 4px 10px;
-      border-radius: 12px;
-      font-size: 0.75rem;
-      font-weight: 700;
-      cursor: pointer;
-    }
-    .banner-cancel-btn:hover {
-      background: rgba(239, 68, 68, 0.3);
-      color: #fca5a5;
-    }
-
-    /* TOP RIGHT PILLS */
+    /* TOP RIGHT FLOATING PILLS (SAFE AREA PROTECTED) */
     .floating-controls-top-right {
       position: absolute;
-      top: 14px;
+      top: calc(16px + env(safe-area-inset-top, 0px));
       right: 14px;
       display: flex;
       flex-direction: column;
       gap: 8px;
-      z-index: 900;
+      z-index: 500;
     }
-    .map-btn {
-      background: rgba(15, 23, 42, 0.9);
+
+    .map-pill-btn {
+      background: rgba(15, 23, 42, 0.88);
       backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
       border: 1px solid rgba(255, 255, 255, 0.15);
       border-radius: 20px;
-      padding: 8px 14px;
       color: #f8fafc;
-      font-size: 0.78rem;
+      padding: 6px 12px;
+      font-size: 0.75rem;
       font-weight: 700;
       display: flex;
       align-items: center;
       gap: 6px;
       cursor: pointer;
       box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-      transition: all 0.2s ease;
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
     }
-    .map-btn.active {
-      background: #10b981;
-      color: #0f172a;
-      border-color: #34d399;
-      box-shadow: 0 4px 14px rgba(16, 185, 129, 0.4);
+    .map-pill-btn:hover {
+      background: rgba(30, 41, 59, 0.95);
+      border-color: rgba(56, 189, 248, 0.5);
+      transform: translateY(-1px);
+    }
+    .range-btn.active {
+      border-color: rgba(16, 185, 129, 0.6);
+      color: #34d399;
     }
 
-    /* BOTTOM RIGHT ACTION BUTTONS */
+    /* BOTTOM RIGHT FLOATING CONTROLS (DYNAMICALLY LIFTS ABOVE DRAWER) */
     .floating-controls-bottom-right {
       position: absolute;
-      bottom: 24px;
       right: 14px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
-      z-index: 900;
+      gap: 8px;
+      z-index: 1050;
+      transition: bottom 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      bottom: calc(28px + env(safe-area-inset-bottom, 0px));
     }
-    .action-circle-btn {
-      width: 44px;
-      height: 44px;
+
+    .floating-controls-bottom-right.drawer-collapsed {
+      bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .floating-controls-bottom-right.drawer-expanded {
+      bottom: calc(49dvh + 12px);
+    }
+
+    @media (min-width: 768px) {
+      .floating-controls-bottom-right {
+        bottom: 28px !important;
+      }
+    }
+
+    .map-action-fab {
+      width: 42px;
+      height: 42px;
       border-radius: 50%;
-      background: rgba(15, 23, 42, 0.9);
-      backdrop-filter: blur(12px);
+      background: rgba(15, 23, 42, 0.95);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
       border: 1px solid rgba(255, 255, 255, 0.18);
       color: #f8fafc;
       display: flex;
       align-items: center;
       justify-content: center;
       cursor: pointer;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.6);
+      transition: all 0.2s ease;
     }
-    .action-circle-btn svg {
-      width: 20px;
-      height: 20px;
+    .map-action-fab:hover {
+      background: #1e293b;
+      border-color: #38bdf8;
+      color: #38bdf8;
+      transform: scale(1.05);
     }
-    /* GRADE LEGEND BAR */
-    .grade-legend-bar {
+    .fab-icon {
+      width: 19px;
+      height: 19px;
+    }
+
+    /* PICKING MODE TOP BANNER */
+    .picking-mode-banner {
       position: absolute;
-      bottom: 24px;
-      left: 14px;
-      background: rgba(15, 23, 42, 0.9);
-      backdrop-filter: blur(14px);
-      border: 1px solid rgba(255, 255, 255, 0.15);
-      border-radius: 12px;
-      padding: 6px 12px;
-      z-index: 900;
+      top: calc(16px + env(safe-area-inset-top, 0px));
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(15, 23, 42, 0.92);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1.5px solid #38bdf8;
+      border-radius: 24px;
+      padding: 6px 14px;
       display: flex;
-      flex-direction: column;
-      gap: 4px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+      align-items: center;
+      gap: 10px;
+      z-index: 600;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+      animation: dropDown 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     }
-    .legend-title {
-      font-size: 0.58rem;
-      font-weight: 800;
-      color: #64748b;
-      letter-spacing: 0.06em;
+    .banner-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: #f8fafc;
+    }
+    .picking-pulse {
+      width: 8px;
+      height: 8px;
+      background: #38bdf8;
+      border-radius: 50%;
+      box-shadow: 0 0 10px #38bdf8;
+      animation: pulse 1s infinite;
+    }
+    .banner-cancel-btn {
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      color: #94a3b8;
+      border-radius: 12px;
+      padding: 2px 8px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    /* MAP GRADE LEGEND OVERLAY */
+    .map-grade-legend {
+      position: absolute;
+      top: 14px;
+      left: 14px;
+      background: rgba(15, 23, 42, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 6px 10px;
+      z-index: 500;
     }
     .legend-items {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-    }
-    .legend-pill {
-      font-size: 0.68rem;
-      font-weight: 700;
-      color: #f8fafc;
-      display: flex;
-      align-items: center;
-      gap: 3px;
-    }
-
-    @keyframes dropDown {
-      from { transform: translate(-50%, -20px); opacity: 0; }
-      to { transform: translate(-50%, 0); opacity: 1; }
-    }
-    @keyframes pulse {
-      0%, 100% { transform: scale(1); opacity: 1; }
-      50% { transform: scale(1.4); opacity: 0.6; }
     }
   `]
 })
@@ -279,6 +287,8 @@ export class MapViewComponent implements OnInit, OnDestroy {
   physicsService = inject(EBikePhysicsService);
   gpsService = inject(GpsTrackingService);
   routerService = inject(GraphRouterService);
+  geocodingService = inject(GeocodingService);
+  storageService = inject(StorageService);
 
   readonly openNetworkSelector = output<void>();
   readonly openTelemetry = output<void>();
@@ -294,6 +304,8 @@ export class MapViewComponent implements OnInit, OnDestroy {
   private originMarker: L.Marker | null = null;
   private destMarker: L.Marker | null = null;
   private rangeCircleLayer: L.Circle | null = null;
+  private hasAutoCentered = false;
+  private lastRouteSetKey = '';
 
   constructor() {
     // React to route changes
@@ -304,6 +316,7 @@ export class MapViewComponent implements OnInit, OnDestroy {
           this.renderRoute(route);
         } else {
           this.routeLayerGroup.clearLayers();
+          this.lastRouteSetKey = '';
         }
       }
     });
@@ -332,12 +345,43 @@ export class MapViewComponent implements OnInit, OnDestroy {
         this.rangeCircleLayer.setRadius(radiusMeters);
       }
     });
+
+    // React to drawer expand/collapse to keep map centered in the remaining free viewport
+    effect(() => {
+      const isDrawerOpen = this.navService.isPlannerOpen();
+      const isCollapsed = this.navService.isPlannerCollapsed();
+      const route = this.navService.activeRoute();
+
+      if (this.map && !this.navService.isNavigating()) {
+        if (route && route.coordinates.length >= 2) {
+          const latLngs = route.coordinates.map(p => [p.lat, p.lng] as L.LatLngTuple);
+          this.focusOnCalculatedRoute(latLngs);
+        } else {
+          const riderPos = this.gpsService.currentPosition().point;
+          if (riderPos && (riderPos.lat !== 0 || riderPos.lng !== 0)) {
+            this.centerOnLocation(riderPos, this.map.getZoom());
+          }
+        }
+      }
+    });
   }
 
-  ngOnInit(): void {
+  async ngOnInit(): Promise<void> {
     this.initLeafletMap();
     this.renderBikeNetwork();
     this.renderPOIs();
+
+    // Automatically request live GPS position and center map on user
+    try {
+      const posState = await this.gpsService.getCurrentLocationOrRequest();
+      if (posState && !posState.isSimulated && this.map) {
+        this.hasAutoCentered = true;
+        this.map.setView([posState.point.lat, posState.point.lng], 16, { animate: true });
+        this.updateRiderPosition(posState);
+      }
+    } catch {
+      this.gpsService.startTracking();
+    }
   }
 
   ngOnDestroy(): void {
@@ -375,87 +419,195 @@ export class MapViewComponent implements OnInit, OnDestroy {
     // Initial Range Circle
     this.initRangeCircle(defaultCenter);
 
-    // Set up Map Click Listener for interactive point picking
-    this.map.on('click', (e: L.LeafletMouseEvent) => {
-      this.handleMapClick(e.latlng);
+    // Set up Map Interaction Listeners (Long press for point selection)
+    this.setupMapInteractionListeners();
+  }
+
+  private longPressTimer: ReturnType<typeof setTimeout> | null = null;
+  private touchStartPos: { x: number; y: number } | null = null;
+
+  private isRouteCreationMode(): boolean {
+    // Available when planning waypoints before route calculation, or when actively picking a point on map
+    if (this.navService.isNavigating()) return false;
+    if (this.navService.activePickingWaypointIndex() !== null) return true;
+    return this.navService.activeRoute() === null;
+  }
+
+  private setupMapInteractionListeners(): void {
+    if (!this.map) return;
+
+    // 1. Direct click when actively picking a specific waypoint from the UI (e.g. "📍 Map" button)
+    this.map.on('click', async (e: L.LeafletMouseEvent) => {
+      const pickingIdx = this.navService.activePickingWaypointIndex();
+      if (pickingIdx !== null && this.isRouteCreationMode()) {
+        const clickedPoint: GeoPoint = {
+          lat: Number(e.latlng.lat.toFixed(6)),
+          lng: Number(e.latlng.lng.toFixed(6)),
+          ele: 25
+        };
+        const geo = await this.geocodingService.reverseGeocode(clickedPoint.lat, clickedPoint.lng);
+        this.navService.setWaypoint(pickingIdx, clickedPoint, geo.name);
+        this.storageService.recordPlaceUsage(geo.name, geo.street || 'Map Pin', clickedPoint);
+      }
+    });
+
+    // 2. Long Press on Touch devices
+    this.map.on('touchstart', (e: any) => {
+      this.cancelLongPress();
+      if (this.isRouteCreationMode()) {
+        const point = e.containerPoint || (e.touches && e.touches[0] ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : { x: 0, y: 0 });
+        this.touchStartPos = { x: point.x, y: point.y };
+        this.longPressTimer = setTimeout(() => {
+          if (e.latlng) {
+            this.handleLongPress(e.latlng);
+          }
+          this.cancelLongPress();
+        }, 500);
+      }
+    });
+
+    this.map.on('touchmove', (e: any) => {
+      if (this.touchStartPos) {
+        const point = e.containerPoint || (e.touches && e.touches[0] ? { x: e.touches[0].clientX, y: e.touches[0].clientY } : null);
+        if (point) {
+          const dx = Math.abs(point.x - this.touchStartPos.x);
+          const dy = Math.abs(point.y - this.touchStartPos.y);
+          if (dx > 10 || dy > 10) {
+            this.cancelLongPress();
+          }
+        }
+      }
+    });
+
+    this.map.on('touchend', () => {
+      this.cancelLongPress();
+    });
+
+    // 3. Long Press on Mouse / Desktop
+    this.map.on('mousedown', (e: any) => {
+      if (e.originalEvent && e.originalEvent.button !== 0) return; // Only left click
+      this.cancelLongPress();
+      if (this.isRouteCreationMode()) {
+        this.touchStartPos = { x: e.containerPoint?.x ?? 0, y: e.containerPoint?.y ?? 0 };
+        this.longPressTimer = setTimeout(() => {
+          if (e.latlng) {
+            this.handleLongPress(e.latlng);
+          }
+          this.cancelLongPress();
+        }, 500);
+      }
+    });
+
+    this.map.on('mousemove', (e: any) => {
+      if (this.touchStartPos && e.containerPoint) {
+        const dx = Math.abs(e.containerPoint.x - this.touchStartPos.x);
+        const dy = Math.abs(e.containerPoint.y - this.touchStartPos.y);
+        if (dx > 8 || dy > 8) {
+          this.cancelLongPress();
+        }
+      }
+    });
+
+    this.map.on('mouseup', () => {
+      this.cancelLongPress();
+    });
+
+    // 4. Desktop Right-click / Context Menu (acts as instant long-press)
+    this.map.on('contextmenu', (e: any) => {
+      if (this.isRouteCreationMode() && e.latlng) {
+        this.handleLongPress(e.latlng);
+      }
     });
   }
 
-  private handleMapClick(latlng: L.LatLng): void {
-    const clickedPoint: GeoPoint = { lat: Number(latlng.lat.toFixed(6)), lng: Number(latlng.lng.toFixed(6)), ele: 25 };
-    const pickingIdx = this.navService.activePickingWaypointIndex();
+  private cancelLongPress(): void {
+    if (this.longPressTimer) {
+      clearTimeout(this.longPressTimer);
+      this.longPressTimer = null;
+    }
+    this.touchStartPos = null;
+  }
 
+  private async handleLongPress(latlng: L.LatLng): Promise<void> {
+    if (!this.isRouteCreationMode() || !this.map) return;
+
+    // Trigger haptic pulse on mobile devices
+    this.gpsService.triggerTurnHaptic();
+
+    const clickedPoint: GeoPoint = {
+      lat: Number(latlng.lat.toFixed(6)),
+      lng: Number(latlng.lng.toFixed(6)),
+      ele: 25
+    };
+
+    const pickingIdx = this.navService.activePickingWaypointIndex();
     if (pickingIdx !== null) {
-      this.navService.setWaypoint(pickingIdx, clickedPoint);
+      const geo = await this.geocodingService.reverseGeocode(clickedPoint.lat, clickedPoint.lng);
+      this.navService.setWaypoint(pickingIdx, clickedPoint, geo.name);
+      this.storageService.recordPlaceUsage(geo.name, geo.street || 'Map Pin', clickedPoint);
       return;
     }
 
-    // Normal mode: Show context popup at click location
-    if (this.map) {
-      const popupContent = document.createElement('div');
-      popupContent.style.fontFamily = 'sans-serif';
-      popupContent.style.padding = '4px 0';
-      popupContent.style.color = '#0f172a';
+    // Lookup street name & number for the location
+    const geo = await this.geocodingService.reverseGeocode(clickedPoint.lat, clickedPoint.lng);
+    const locationTitle = geo.name || `Location (${clickedPoint.lat.toFixed(4)}, ${clickedPoint.lng.toFixed(4)})`;
 
-      popupContent.innerHTML = `
-        <div style="font-weight: 700; font-size: 13px; margin-bottom: 6px; color: #0284c7;">
-          📍 Selected Location (${clickedPoint.lat.toFixed(4)}, ${clickedPoint.lng.toFixed(4)})
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 6px;">
-          <button id="set-origin-btn" style="background: #10b981; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; font-weight: 700; font-size: 11px; cursor: pointer; text-align: left;">
-            🟢 Set as Start Point (A)
-          </button>
-          <button id="add-stop-btn" style="background: #f59e0b; color: #0f172a; border: none; padding: 6px 10px; border-radius: 6px; font-weight: 700; font-size: 11px; cursor: pointer; text-align: left;">
-            ➕ Add as Intermediate Stop
-          </button>
-          <button id="set-dest-btn" style="background: #ef4444; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; font-weight: 700; font-size: 11px; cursor: pointer; text-align: left;">
-            🏁 Set as Destination
-          </button>
-          <button id="route-here-btn" style="background: #0284c7; color: #fff; border: none; padding: 6px 10px; border-radius: 6px; font-weight: 700; font-size: 11px; cursor: pointer; text-align: left;">
-            ⚡ Route from GPS to Here
-          </button>
-        </div>
-      `;
+    // Show themed context popup for setting start, stop, or destination
+    const popupContent = document.createElement('div');
+    popupContent.style.fontFamily = 'sans-serif';
+    popupContent.style.padding = '4px 0';
+    popupContent.style.color = '#0f172a';
+    popupContent.style.maxWidth = '240px';
 
-      const popup = L.popup({ className: 'custom-map-click-popup' })
-        .setLatLng(latlng)
-        .setContent(popupContent)
-        .openOn(this.map);
+    popupContent.innerHTML = `
+      <div style="font-weight: 800; font-size: 12px; margin-bottom: 8px; color: #0284c7; display: flex; align-items: center; gap: 4px; line-height: 1.3;">
+        <span>📍</span> <span>${locationTitle}</span>
+      </div>
+      <div style="display: flex; flex-direction: column; gap: 6px;">
+        <button id="set-origin-btn" style="background: #10b981; color: #0f172a; border: none; padding: 7px 10px; border-radius: 8px; font-weight: 800; font-size: 11px; cursor: pointer; text-align: left; display: flex; align-items: center; gap: 6px;">
+          🟢 Set as Pickup / Start (A)
+        </button>
+        <button id="set-dest-btn" style="background: #ef4444; color: #fff; border: none; padding: 7px 10px; border-radius: 8px; font-weight: 800; font-size: 11px; cursor: pointer; text-align: left; display: flex; align-items: center; gap: 6px;">
+          🏁 Set as Destination (B)
+        </button>
+        <button id="add-stop-btn" style="background: rgba(0,0,0,0.06); color: #0f172a; border: 1px solid rgba(0,0,0,0.15); padding: 6px 10px; border-radius: 8px; font-weight: 700; font-size: 11px; cursor: pointer; text-align: left; display: flex; align-items: center; gap: 6px;">
+          ➕ Add as Stop
+        </button>
+      </div>
+    `;
 
-      setTimeout(() => {
-        const originBtn = document.getElementById('set-origin-btn');
-        const addStopBtn = document.getElementById('add-stop-btn');
-        const destBtn = document.getElementById('set-dest-btn');
-        const routeHereBtn = document.getElementById('route-here-btn');
+    const popup = L.popup({ className: 'custom-map-click-popup' })
+      .setLatLng(latlng)
+      .setContent(popupContent)
+      .openOn(this.map);
 
-        if (originBtn) {
-          originBtn.onclick = () => {
-            this.navService.setOriginPoint(clickedPoint);
-            this.map?.closePopup();
-          };
-        }
-        if (addStopBtn) {
-          addStopBtn.onclick = () => {
-            this.navService.addWaypoint(clickedPoint);
-            this.map?.closePopup();
-          };
-        }
-        if (destBtn) {
-          destBtn.onclick = () => {
-            this.navService.setDestinationPoint(clickedPoint);
-            this.map?.closePopup();
-          };
-        }
-        if (routeHereBtn) {
-          routeHereBtn.onclick = () => {
-            const gpsPt = this.gpsService.currentPosition().point;
-            this.navService.setOriginPoint(gpsPt);
-            this.navService.setDestinationPoint(clickedPoint);
-            this.map?.closePopup();
-          };
-        }
-      }, 50);
-    }
+    setTimeout(() => {
+      const originBtn = document.getElementById('set-origin-btn');
+      const addStopBtn = document.getElementById('add-stop-btn');
+      const destBtn = document.getElementById('set-dest-btn');
+
+      if (originBtn) {
+        originBtn.onclick = () => {
+          this.navService.setOriginPoint(clickedPoint, locationTitle);
+          this.storageService.recordPlaceUsage(locationTitle, geo.street || 'Start', clickedPoint);
+          this.map?.closePopup();
+        };
+      }
+      if (addStopBtn) {
+        addStopBtn.onclick = () => {
+          this.navService.addWaypoint(clickedPoint, locationTitle);
+          this.storageService.recordPlaceUsage(locationTitle, geo.street || 'Stop', clickedPoint);
+          this.map?.closePopup();
+        };
+      }
+      if (destBtn) {
+        destBtn.onclick = () => {
+          this.navService.setDestinationPoint(clickedPoint, locationTitle);
+          this.storageService.recordPlaceUsage(locationTitle, geo.street || 'Destination', clickedPoint);
+          this.map?.closePopup();
+        };
+      }
+    }, 50);
   }
 
   private renderDraggableWaypoints(waypoints: RouteWaypoint[]): void {
@@ -549,6 +701,12 @@ export class MapViewComponent implements OnInit, OnDestroy {
       this.rangeCircleLayer.setLatLng(latLng);
     }
 
+    // Auto-center once when first real GPS fix arrives
+    if (!this.hasAutoCentered && !pos.isSimulated) {
+      this.hasAutoCentered = true;
+      this.map.setView(latLng, 16, { animate: true });
+    }
+
     // Rotate directional heading cone
     const element = this.riderMarker.getElement();
     if (element) {
@@ -608,6 +766,8 @@ export class MapViewComponent implements OnInit, OnDestroy {
   private renderRoute(route: RouteResult): void {
     this.routeLayerGroup.clearLayers();
     if (!this.map || route.coordinates.length < 2) return;
+
+    this.map.closePopup();
 
     const availableRoutes = this.navService.availableRoutes();
     const currentActiveIdx = this.navService.selectedRouteIndex();
@@ -695,8 +855,13 @@ export class MapViewComponent implements OnInit, OnDestroy {
       this.routeLayerGroup.addLayer(mainRoute);
     }
 
-    if (this.map && !this.navService.isNavigating()) {
-      this.focusOnCalculatedRoute(activeLatLngs);
+    // Auto-focus camera ONLY when a NEW set of routes is computed, preventing screen jump/flash on switching cards
+    const routeSetKey = availableRoutes.map(r => r.id).join('|');
+    if (routeSetKey !== this.lastRouteSetKey) {
+      this.lastRouteSetKey = routeSetKey;
+      if (this.map && !this.navService.isNavigating()) {
+        this.focusOnCalculatedRoute(activeLatLngs);
+      }
     }
   }
 
@@ -713,14 +878,22 @@ export class MapViewComponent implements OnInit, OnDestroy {
     }
 
     const isDesktop = window.innerWidth > 768;
-    const paddingTL: L.PointTuple = isDesktop ? [420, 40] : [20, 20];
-    const paddingBR: L.PointTuple = [40, 40];
+    const isDrawerOpen = this.navService.isPlannerOpen();
+    const isCollapsed = this.navService.isPlannerCollapsed();
+
+    let bottomPadding = 30;
+    if (!isDesktop && isDrawerOpen) {
+      bottomPadding = isCollapsed ? 80 : Math.round(window.innerHeight * 0.49);
+    }
+
+    const paddingTL: L.PointTuple = isDesktop ? [460, 40] : [24, 24];
+    const paddingBR: L.PointTuple = isDesktop ? [40, 40] : [24, bottomPadding];
 
     this.map.flyToBounds(bounds, {
       paddingTopLeft: paddingTL,
       paddingBottomRight: paddingBR,
       maxZoom: 16,
-      duration: 1.0,
+      duration: 0.8,
       easeLinearity: 0.25
     });
   }
@@ -744,10 +917,27 @@ export class MapViewComponent implements OnInit, OnDestroy {
     this.focusOnCalculatedRoute(latLngs);
   }
 
-  recenterOnRider(): void {
+  centerOnLocation(point: GeoPoint, zoom = 16): void {
     if (!this.map) return;
-    const pos = this.gpsService.currentPosition().point;
-    this.map.setView([pos.lat, pos.lng], 15, { animate: true });
+    const isDesktop = window.innerWidth > 768;
+    const isDrawerOpen = this.navService.isPlannerOpen();
+    const isCollapsed = this.navService.isPlannerCollapsed();
+
+    // Center point in the remaining visible area above the drawer
+    if (!isDesktop && isDrawerOpen && !isCollapsed) {
+      const freeAreaOffsetPx = Math.round(window.innerHeight * 0.22);
+      this.map.setView([point.lat, point.lng], zoom, { animate: false });
+      this.map.panBy([0, freeAreaOffsetPx], { animate: true, duration: 0.4 });
+    } else {
+      this.map.setView([point.lat, point.lng], zoom, { animate: true });
+    }
+  }
+
+  async recenterOnRider(): Promise<void> {
+    const posState = await this.gpsService.getCurrentLocationOrRequest();
+    if (!this.map) return;
+    const pos = posState.point;
+    this.centerOnLocation(pos, 16);
   }
 
   switchNetwork(networkId: string): void {

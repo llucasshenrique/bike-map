@@ -194,7 +194,7 @@ import { AssistLevel } from '../../core/models/ebike.types';
       flex-direction: column;
       justify-content: space-between;
       z-index: 1000;
-      padding: 12px;
+      padding: calc(14px + env(safe-area-inset-top, 0px)) 12px calc(14px + env(safe-area-inset-bottom, 0px));
     }
     .hud-overlay > * {
       pointer-events: auto;

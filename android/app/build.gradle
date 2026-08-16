@@ -52,3 +52,22 @@ try {
 } catch(Exception e) {
     logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
 }
+
+tasks.register('copyApkToDist', Copy) {
+    from("${layout.buildDirectory.get()}/outputs/apk") {
+        include '**/*.apk'
+        eachFile { path = name }
+        includeEmptyDirs = false
+    }
+    into rootProject.file("../dist/android")
+}
+
+afterEvaluate {
+    tasks.named('assembleDebug').configure {
+        finalizedBy 'copyApkToDist'
+    }
+    tasks.named('assembleRelease').configure {
+        finalizedBy 'copyApkToDist'
+    }
+}
+

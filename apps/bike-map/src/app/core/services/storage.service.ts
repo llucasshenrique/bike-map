@@ -1,6 +1,7 @@
 import { Injectable } from '@angular/core';
 import { RouteResult } from '../models/routing.types';
 import { EBikeConfig } from '../models/ebike.types';
+import { GeoPoint } from '../models/geo.types';
 
 export interface SavedRouteItem {
   id: string;
@@ -12,12 +13,22 @@ export interface SavedRouteItem {
   routeData: RouteResult;
 }
 
+export interface FrequentPlaceItem {
+  id: string;
+  name: string;
+  subText: string;
+  point: GeoPoint;
+  useCount: number;
+  lastUsed: number;
+}
+
 @Injectable({
   providedIn: 'root'
 })
 export class StorageService {
   private readonly SAVED_ROUTES_KEY = 'ebike_saved_routes';
   private readonly EBIKE_CONFIG_KEY = 'ebike_user_config';
+  private readonly FREQUENT_PLACES_KEY = 'ebike_frequent_places';
 
   getSavedRoutes(): SavedRouteItem[] {
     try {
@@ -62,5 +73,50 @@ export class StorageService {
     } catch {
       return null;
     }
+  }
+
+  // --- FREQUENT / COMMON PLACES STORAGE ---
+
+  getFrequentPlaces(): FrequentPlaceItem[] {
+    try {
+      const data = localStorage.getItem(this.FREQUENT_PLACES_KEY);
+      const list: FrequentPlaceItem[] = data ? JSON.parse(data) : [];
+      // Sort by useCount desc, then lastUsed desc
+      return list.sort((a, b) => b.useCount - a.useCount || b.lastUsed - a.lastUsed);
+    } catch {
+      return [];
+    }
+  }
+
+  recordPlaceUsage(name: string, subText: string, point: GeoPoint): void {
+    if (!name || !point) return;
+    try {
+      const places = this.getFrequentPlaces();
+      // Match if coordinates are close (~50m) or identical name
+      const existingIdx = places.findIndex(p =>
+        (Math.abs(p.point.lat - point.lat) < 0.0005 && Math.abs(p.point.lng - point.lng) < 0.0005) ||
+        p.name.toLowerCase() === name.toLowerCase()
+      );
+
+      if (existingIdx >= 0) {
+        places[existingIdx].useCount += 1;
+        places[existingIdx].lastUsed = Date.now();
+        places[existingIdx].name = name;
+        if (subText) places[existingIdx].subText = subText;
+      } else {
+        places.unshift({
+          id: `fp_${Date.now()}`,
+          name,
+          subText: subText || 'Frequent destination',
+          point,
+          useCount: 1,
+          lastUsed: Date.now()
+        });
+      }
+
+      // Limit storage to top 20 frequent places
+      const trimmed = places.slice(0, 20);
+      localStorage.setItem(this.FREQUENT_PLACES_KEY, JSON.stringify(trimmed));
+    } catch {}
   }
 }

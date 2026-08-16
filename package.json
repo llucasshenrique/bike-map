@@ -5,9 +5,11 @@
   "scripts": {
     "start": "nx serve bike-map",
     "build": "nx build bike-map",
-    "cap:sync": "nx build bike-map && cap sync android",
-    "cap:open": "cap open android",
-    "cap:run": "cap run android"
+    "cap:sync": "nx run bike-map:cap-sync",
+    "cap:open": "nx run bike-map:cap-open",
+    "cap:run": "nx run bike-map:cap-run",
+    "build:apk": "nx run bike-map:build-apk",
+    "build:apk:release": "nx run bike-map:build-apk-release"
   },
   "private": true,
   "dependencies": {

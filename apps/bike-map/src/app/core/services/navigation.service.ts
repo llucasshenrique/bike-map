@@ -33,6 +33,8 @@ export class NavigationService {
   readonly distanceToNextManeuverMeters = signal<number>(0);
   readonly isNavigating = signal<boolean>(false);
   readonly isPaused = signal<boolean>(false);
+  readonly isPlannerOpen = signal<boolean>(true);
+  readonly isPlannerCollapsed = signal<boolean>(false);
 
   readonly selectedProfile = signal<RoutingProfile>('efficient');
   readonly isOffRoute = signal<boolean>(false);

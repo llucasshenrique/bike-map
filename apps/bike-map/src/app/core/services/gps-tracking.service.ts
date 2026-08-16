@@ -1,4 +1,4 @@
-import { Injectable, signal, inject } from '@angular/core';
+import { Injectable, signal, inject, PLATFORM_ID } from '@angular/core';
 import { Geolocation, Position } from '@capacitor/geolocation';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { GeoPoint } from '../models/geo.types';
@@ -15,10 +15,11 @@ export interface RiderPositionState {
 }
 
 @Injectable({
-  providedIn: 'root'
+  providedIn: 'root',
 })
 export class GpsTrackingService {
   private networkService = inject(OfflineNetworkService);
+  private platform = inject(PLATFORM_ID);
 
   readonly currentPosition = signal<RiderPositionState>({
     point: { lat: 37.7749, lng: -122.4194, ele: 30 },
@@ -26,7 +27,7 @@ export class GpsTrackingService {
     heading: 0,
     accuracy: 5,
     timestamp: Date.now(),
-    isSimulated: false
+    isSimulated: false,
   });
 
   readonly isTracking = signal<boolean>(false);
@@ -38,41 +39,97 @@ export class GpsTrackingService {
   private simCoordIndex = 0;
   private simActiveRoute: RouteResult | null = null;
 
+  async getCurrentLocationOrRequest(): Promise<RiderPositionState> {
+    // 1. Check if running inside native Capacitor
+    try {
+      if (this.platform === 'android') {
+        const perm = await Geolocation.checkPermissions();
+        if (perm.location !== 'granted') {
+          await Geolocation.requestPermissions();
+        }
+        const pos = await Geolocation.getCurrentPosition({
+          enableHighAccuracy: true,
+          timeout: 10000,
+        });
+        this.updateFromCapacitorPos(pos);
+        if (!this.isTracking()) {
+          this.startTracking();
+        }
+        return this.currentPosition();
+      }
+    } catch (e) {
+      console.warn('Capacitor geolocation fallback to browser API', e);
+    }
+
+    // 2. Standard Browser / Web Geolocation API
+    if (this.platform === 'browser') {
+      return new Promise<RiderPositionState>((resolve) => {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            this.updateFromBrowserPos(pos);
+            if (!this.isTracking()) {
+              this.startTracking();
+            }
+            resolve(this.currentPosition());
+          },
+          (err) => {
+            console.warn('Geolocation prompt/error:', err);
+            resolve(this.currentPosition());
+          },
+          { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 },
+        );
+      });
+    }
+
+    return this.currentPosition();
+  }
+
   async startTracking(): Promise<void> {
     if (this.isTracking()) return;
 
     try {
-      // Check permissions
-      const status = await Geolocation.checkPermissions();
-      if (status.location !== 'granted') {
-        await Geolocation.requestPermissions();
-      }
-
-      // Initial quick fix
-      const pos = await Geolocation.getCurrentPosition({ enableHighAccuracy: true });
-      this.updateFromCapacitorPos(pos);
-
-      // Watch continuously
-      this.watchId = await Geolocation.watchPosition(
-        { enableHighAccuracy: true, timeout: 5000, maximumAge: 1000 },
-        (position, err) => {
-          if (err || !position) return;
-          this.updateFromCapacitorPos(position);
+      if (
+        typeof (window as any)?.Capacitor !== 'undefined' &&
+        (window as any).Capacitor.isNativePlatform()
+      ) {
+        // Check permissions
+        const status = await Geolocation.checkPermissions();
+        if (status.location !== 'granted') {
+          await Geolocation.requestPermissions();
         }
-      );
 
-      this.isTracking.set(true);
-    } catch {
-      // Fallback to HTML5 Geolocation API
-      if (typeof navigator !== 'undefined' && 'geolocation' in navigator) {
-        const id = navigator.geolocation.watchPosition(
-          pos => this.updateFromBrowserPos(pos),
-          () => {},
-          { enableHighAccuracy: true }
+        // Initial quick fix
+        const pos = await Geolocation.getCurrentPosition({
+          enableHighAccuracy: true,
+          timeout: 10000,
+        });
+        this.updateFromCapacitorPos(pos);
+
+        // Watch continuously
+        this.watchId = await Geolocation.watchPosition(
+          { enableHighAccuracy: true, timeout: 5000, maximumAge: 1000 },
+          (position, err) => {
+            if (err || !position) return;
+            this.updateFromCapacitorPos(position);
+          },
         );
-        this.watchId = String(id);
+
         this.isTracking.set(true);
+        return;
       }
+    } catch (err) {
+      console.warn('Capacitor watch fallback:', err);
+    }
+
+    // Fallback to HTML5 Geolocation API
+    if (typeof navigator !== 'undefined' && 'geolocation' in navigator) {
+      const id = navigator.geolocation.watchPosition(
+        (pos) => this.updateFromBrowserPos(pos),
+        (err) => console.warn('Browser watch error:', err),
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 2000 },
+      );
+      this.watchId = String(id);
+      this.isTracking.set(true);
     }
   }
 
@@ -109,7 +166,7 @@ export class GpsTrackingService {
       heading: 0,
       accuracy: 2,
       timestamp: Date.now(),
-      isSimulated: true
+      isSimulated: true,
     });
 
     const stepIntervalMs = 1000;
@@ -137,7 +194,7 @@ export class GpsTrackingService {
         heading,
         accuracy: 1,
         timestamp: Date.now(),
-        isSimulated: true
+        isSimulated: true,
       });
     }, stepIntervalMs / this.simulationSpeedMultiplier());
   }
@@ -175,13 +232,13 @@ export class GpsTrackingService {
       point: {
         lat: pos.coords.latitude,
         lng: pos.coords.longitude,
-        ele: pos.coords.altitude ?? 30
+        ele: pos.coords.altitude ?? 30,
       },
       speedKmh: pos.coords.speed ? Math.round(pos.coords.speed * 3.6) : 0,
       heading: pos.coords.heading ?? 0,
       accuracy: pos.coords.accuracy,
       timestamp: pos.timestamp,
-      isSimulated: false
+      isSimulated: false,
     });
   }
 
@@ -190,13 +247,13 @@ export class GpsTrackingService {
       point: {
         lat: pos.coords.latitude,
         lng: pos.coords.longitude,
-        ele: pos.coords.altitude ?? 30
+        ele: pos.coords.altitude ?? 30,
       },
       speedKmh: pos.coords.speed ? Math.round(pos.coords.speed * 3.6) : 0,
       heading: pos.coords.heading ?? 0,
       accuracy: pos.coords.accuracy,
       timestamp: pos.timestamp,
-      isSimulated: false
+      isSimulated: false,
     });
   }
 
@@ -206,7 +263,9 @@ export class GpsTrackingService {
     const dLng = ((end.lng - start.lng) * Math.PI) / 180;
 
     const y = Math.sin(dLng) * Math.cos(lat2);
-    const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+    const x =
+      Math.cos(lat1) * Math.sin(lat2) -
+      Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
     const brng = (Math.atan2(y, x) * 180) / Math.PI;
     return Math.round((brng + 360) % 360);
   }
