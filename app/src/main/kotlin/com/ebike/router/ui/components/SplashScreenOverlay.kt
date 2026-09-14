@@ -66,36 +66,29 @@ fun SplashScreenOverlay(
                 // E-Bike Glowing Logo Badge
                 Box(
                     modifier = Modifier
-                        .size(110.dp)
+                        .size(120.dp)
                         .clip(CircleShape)
                         .background(
                             Brush.radialGradient(
                                 colors = listOf(
-                                    CyanPrimary.copy(alpha = 0.3f),
+                                    CyanPrimary.copy(alpha = 0.35f),
                                     Color.Transparent
                                 )
                             )
                         )
-                        .padding(12.dp),
+                        .padding(8.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Box(
+                    Image(
+                        painter = painterResource(R.mipmap.ic_launcher),
+                        contentDescription = "Logo E-Bike",
                         modifier = Modifier
-                            .size(76.dp)
-                            .clip(CircleShape)
-                            .background(Slate800),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            Icons.Default.ElectricBike,
-                            contentDescription = "E-Bike Logo",
-                            tint = CyanGlow,
-                            modifier = Modifier.size(44.dp)
-                        )
-                    }
+                            .size(90.dp)
+                            .clip(RoundedCornerShape(22.dp))
+                    )
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(20.dp))
 
                 Text(
                     text = "BIKE MAP",
