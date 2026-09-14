@@ -80,7 +80,7 @@ fun SplashScreenOverlay(
                     contentAlignment = Alignment.Center
                 ) {
                     Image(
-                        painter = painterResource(R.mipmap.ic_launcher),
+                        painter = painterResource(R.drawable.app_logo),
                         contentDescription = "Logo E-Bike",
                         modifier = Modifier
                             .size(90.dp)

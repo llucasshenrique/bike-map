@@ -80,6 +80,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     val recenterEvent = MutableStateFlow<Long>(0L)
 
     fun recenterMap() {
+        locationTracker.refreshCurrentLocation()
         recenterEvent.value = System.currentTimeMillis()
     }
 
@@ -250,6 +251,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun useGpsForWaypoint(index: Int) {
+        locationTracker.refreshCurrentLocation()
         val userPoint = locationTracker.locationState.value.point
         setWaypoint(index, userPoint, "Minha Localização GPS")
         showSearchDialogForIndex.value = null
@@ -338,6 +340,14 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun handleRiderLocationUpdate(point: GeoPoint, speedKmh: Double, heading: Float) {
+        // Immediately update telemetry live speed from GPS
+        _telemetry.value = _telemetry.value.copy(
+            currentSpeedKmh = speedKmh,
+            maxSpeedKmh = max(_telemetry.value.maxSpeedKmh, speedKmh),
+            headingDegrees = heading,
+            currentElevationM = point.ele
+        )
+
         val route = activeRoute.value ?: return
         if (!_isNavigating.value || route.instructions.isEmpty()) return
 

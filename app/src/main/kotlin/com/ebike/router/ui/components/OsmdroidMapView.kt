@@ -192,8 +192,19 @@ fun OsmdroidMapView(
     )
 
     val recenterEvent by viewModel.recenterEvent.collectAsState()
+    var hasCenteredInitially by remember { mutableStateOf(false) }
 
-    // Recenter map when triggered
+    // Auto-center on first real GPS fix
+    LaunchedEffect(locationState.hasRealFix) {
+        if (locationState.hasRealFix && !hasCenteredInitially) {
+            val map = mapViewRef ?: return@LaunchedEffect
+            hasCenteredInitially = true
+            val riderPoint = OsmGeoPoint(locationState.point.lat, locationState.point.lng)
+            map.controller.animateTo(riderPoint, 16.5, 600L)
+        }
+    }
+
+    // Recenter map when triggered by user
     LaunchedEffect(recenterEvent) {
         if (recenterEvent > 0L) {
             val map = mapViewRef ?: return@LaunchedEffect

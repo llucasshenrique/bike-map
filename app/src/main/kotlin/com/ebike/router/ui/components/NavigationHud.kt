@@ -118,11 +118,16 @@ fun NavigationHud(
                     // Speedometer
                     Column {
                         Row(verticalAlignment = Alignment.Bottom) {
+                            val speedText = if (telemetry.currentSpeedKmh > 0.0 && telemetry.currentSpeedKmh < 10.0) {
+                                String.format(java.util.Locale.US, "%.1f", telemetry.currentSpeedKmh)
+                            } else {
+                                "${telemetry.currentSpeedKmh.toInt()}"
+                            }
                             Text(
-                                text = "${telemetry.currentSpeedKmh.toInt()}",
-                                fontSize = 34.sp,
+                                text = speedText,
+                                fontSize = 36.sp,
                                 fontWeight = FontWeight.Black,
-                                color = Color.White
+                                color = if (telemetry.currentSpeedKmh > 0.5) EmeraldGreen else Color.White
                             )
                             Text(
                                 text = " km/h",
