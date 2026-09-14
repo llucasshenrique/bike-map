@@ -1,96 +1,98 @@
-# 🚴⚡ E-Bike Offline Navigation Router
+# 🚴⚡ E-Bike Map & Navigation Router (Pure Kotlin)
 
-A high-performance, self-contained offline e-bike navigation and routing system built with **Nx Monorepo**, **Angular (Standalone)**, and **Capacitor for Android**.
+A 100% native Android application built entirely with **Kotlin**, **Jetpack Compose (Material 3)**, **Osmdroid (OpenStreetMap)**, and **Gradle Kotlin DSL (`.kts`)**.
 
-Runs **100% offline with zero external API dependencies**. All graph pathfinding, battery consumption physics modeling, turn-by-turn instruction generation, offline speech synthesis, and GPS simulation execute locally on-device.
+Engineered specifically for electric bicycles (e-bikes) conforming to Brazilian CONTRAN Resolution 996/2023 (motor assist up to 32 km/h), real-world physical resistance modeling, multi-stop routing, worldwide address search, elevation slope coloring, turn-by-turn voice guidance, and an on-device digital bike computer.
 
 ---
 
 ## 🌟 Key Features
 
-- 🔋 **Physics-Based E-Bike Energy Engine**:
-  - Calculates mechanical resistance ($F_{rolling} + F_{gravity} + F_{aero}$) and motor electrical drain in Watt-Hours (Wh) per segment.
-  - Multi-assist mode support: `OFF (0%)`, `ECO (40%)`, `TOUR (100%)`, `SPORT (180%)`, and `TURBO (300%)`.
-  - Dynamic battery reachability isocline / range circle on map based on current Wh and assist mode.
-- ⚡ **Multi-Criteria Offline A\* Router**:
-  - `Eco-Efficient`: Avoids steep climbs and preserves battery.
-  - `Turbo Fast`: High-speed direct routes utilizing motor assist on climbs.
-  - `Scenic Trails`: Prioritizes river paths, parks, gravel trails, and nature corridors.
-  - `Safe Bikeways`: Maximizes dedicated protected cycle tracks and quiet residential streets.
-- 🗣️ **Turn-by-Turn GPS Navigation & HUD**:
-  - Live maneuver icons, distance countdowns, and turn notifications.
-  - Offline Voice Audio Guidance using on-device Web Speech Synthesis.
-  - Auto-rerouting in < 50ms when off-route.
-  - Built-in GPS Ride Simulator (`1x`, `2x`, `4x` speed) for testing routes anywhere.
-- 📊 **Bike Computer Cockpit & Telemetry**:
-  - Digital cockpit with speedometer, motor vs human power split, battery voltage/Wh, trip metrics, and hill climb grades.
-- 🗺️ **Offline Networks & GPX/GeoJSON Trail Importer**:
-  - Bundled high-density bike networks (Emerald Valley, Alpine Crest, Coastal Bayfront).
-  - On-device file importer to load custom trail networks and compile routing graphs offline.
-- 📱 **Native Android Integration**:
-  - Built with `@capacitor/core`, `@capacitor/android`, `@capacitor/geolocation`, and `@capacitor/haptics`.
+- 📱 **100% Pure Kotlin & Jetpack Compose**:
+  - Entire application, UI, services, models, and build configuration written exclusively in Kotlin (`.kt` and `.gradle.kts`).
+  - Declarative reactive UI built with Android Jetpack Compose Material 3.
+- 🗺️ **High-Performance Native OpenStreetMap Engine (Osmdroid)**:
+  - Hardware-accelerated offline tile caching, zero paid API keys or tracking.
+  - Multi-stop waypoints ($A \rightarrow B \rightarrow C \dots \rightarrow N$) with draggable pin markers.
+  - Segment-by-segment **elevation grade coloring**:
+    - 🔵 **Cyan (`< 0%`)**: Downhill sections (inward momentum & regenerative braking).
+    - 🟢 **Emerald (`0% – 3%`)**: Flat & gentle slopes.
+    - 🟡 **Amber (`3% – 7%`)**: Moderate climbs.
+    - 🔴 **Red (`> 7%`)**: Steep ascents requiring high motor assistance.
+  - Interactive alternative routes rendered as dashed clickable candidate paths.
+- 🔋 **E-Bike Physical Resistance Engine (`EBikePhysicsEngine`)**:
+  - Computes mechanical forces ($F_{\text{rolling}} + F_{\text{gravity}} + F_{\text{aero}}$) and motor electrical drain ($\text{Wh}$).
+  - Conforms to **Resolução CONTRAN nº 996/2023** (legal motor cut-off at **32 km/h**).
+  - 5 Assist modes: `OFF (0%)`, `ECO (40%)`, `TOUR (100%)`, `SPORT (180%)`, and `TURBO (300%)`.
+  - Calculates dynamic battery remaining %, remaining range in km, and battery voltage.
+- 🔍 **Worldwide Address & POI Search (`GeocodingService`)**:
+  - Global address search via OpenStreetMap Photon & Nominatim APIs with fast typeahead.
+  - "Usar Minha Localização Atual (GPS)" shortcut.
+- 🗣️ **Turn-by-Turn Voice Navigation & HUD**:
+  - Floating HUD with next maneuver icons, distance countdown, live speedometer, and ETA.
+  - Native voice audio guidance using Android `TextToSpeech` in Portuguese (`pt-BR`).
+  - Built-in GPS Ride Simulator (`1x`, `2x`, `4x` speed) for testing routes without cycling outside.
+- 📊 **Digital Bike Computer Cockpit (`TelemetryCockpitDialog`)**:
+  - Real-time speedometer, average speed, max speed, motor power (W) vs rider leg power (W) split, battery health, and assist selector.
 
 ---
 
-## 🚀 Quick Start (Fish & Bash Compatible)
+## 🚀 Building and Running (Fish & Bash Compatible)
 
-### 1. Run Development Server
+### Prerequisites
+- JDK 17 or 21
+- Android SDK (Platform 35, Build-Tools 34+)
+
+### 1. Build Debug APK
 ```fish
-pnpm start
-# or: nx serve bike-map
+./gradlew assembleDebug
 ```
-Open [http://localhost:4200](http://localhost:4200) in your browser.
+The compiled APK will be generated at:
+`app/build/outputs/apk/debug/app-debug.apk`
 
-### 2. Build Web Assets
+### 2. Install directly to a connected Android device or emulator
 ```fish
-pnpm run build
-# or: nx build bike-map
+./gradlew installDebug
 ```
 
-### 3. Sync & Build Android App
+### 3. Clean Build
 ```fish
-# Sync compiled web bundle to Android native project
-pnpm run cap:sync
-
-# Open Android Studio project
-pnpm run cap:open
-
-# Run directly on connected Android device / emulator
-pnpm run cap:run
+./gradlew clean
 ```
 
 ---
 
-## 📁 Project Architecture
+## 🏛️ Project Architecture
 
 ```
-bike-map/
-├── android/                         # Capacitor Native Android Project
-│   └── app/src/main/
-│       ├── AndroidManifest.xml      # GPS & Native Permissions
-│       └── assets/public/           # Bundled Offline Web Assets
-├── apps/bike-map/
-│   └── src/
-│       ├── app/
-│       │   ├── components/
-│       │   │   ├── map-view/        # Leaflet Offline Map View
-│       │   │   ├── navigation-hud/  # Turn-by-Turn HUD & Speedometer
-│       │   │   ├── route-planner/   # Profile Selector & Summary
-│       │   │   ├── ebike-telemetry/ # Cockpit Dashboard Modal
-│       │   │   ├── elevation-chart/ # SVG Elevation & Grade Scrubber
-│       │   │   └── network-selector/# Offline Network & Specs Manager
-│       │   └── core/
-│       │       ├── models/          # Geo, Routing, EBike, POI types
-│       │       └── services/
-│       │           ├── graph-router.service.ts   # Offline A* Pathfinding
-│       │           ├── ebike-physics.service.ts  # Wh Energy Modeling
-│       │           ├── offline-network.service.ts# Bike Network Graphs
-│       │           ├── navigation.service.ts     # Navigation State Machine
-│       │           ├── gps-tracking.service.ts   # Geolocation & Simulator
-│       │           └── audio-guidance.service.ts # Voice Synthesizer
-│       ├── styles.scss              # Global High-Contrast Styling
-│       └── index.html               # Mobile Viewport & Theme Configuration
-├── capacitor.config.ts              # Capacitor App Configuration
-├── package.json                     # Scripts & Dependencies (pnpm)
-└── nx.json                          # Nx Workspace Configuration
+app/src/main/kotlin/com/ebike/router/
+├── MainActivity.kt                      # Main Activity hosting Jetpack Compose & Permissions
+├── model/
+│   ├── GeoPoint.kt                      # Geographic coordinates & Haversine distance calculations
+│   ├── RoutingModels.kt                 # Multi-stop waypoints, route results, profiles, maneuvers
+│   ├── EBikeModels.kt                   # Assist levels, battery telemetry, and cockpit state
+│   └── GeocodingModels.kt               # Search and geocoding data structures
+├── physics/
+│   └── EBikePhysicsEngine.kt            # On-device Frr + Fgrade + Faero physics & CONTRAN 32 km/h limits
+├── service/
+│   ├── GraphRouterService.kt            # Global OSRM Bike router, multi-stop, alternatives, offline fallback
+│   ├── GeocodingService.kt              # Photon (OSM) & Nominatim search with fast typeahead
+│   ├── AudioGuidanceService.kt          # Android TextToSpeech for turn maneuvers
+│   └── LocationTrackerService.kt        # FusedLocation / GPS tracking & simulator
+└── ui/
+    ├── theme/                           # E-Bike high-contrast color scheme & Material3 Dark Theme
+    ├── viewmodel/
+    │   └── BikeMapViewModel.kt          # Unified ViewModel managing waypoints, routes, navigation, telemetry
+    └── components/
+        ├── OsmdroidMapView.kt           # OpenStreetMap view with multi-stop pins & slope-colored lines
+        ├── RoutePlannerSheet.kt         # Waypoint cards, search, reordering, and alternative route comparison
+        ├── NavigationHud.kt             # Next maneuver banner, distance countdown, speedometer, ETA
+        ├── ElevationProfileChart.kt     # Canvas-based elevation curve with grade colors & scrubber
+        ├── TelemetryCockpitDialog.kt    # Full cockpit bike computer (watts, voltage, stats)
+        └── WaypointSearchDialog.kt      # Fast place/address search dialog
 ```
+
+---
+
+## 📄 License
+MIT License
