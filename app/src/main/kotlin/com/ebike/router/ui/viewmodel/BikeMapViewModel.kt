@@ -76,8 +76,15 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     private val _isSearching = MutableStateFlow(false)
     val isSearching: StateFlow<Boolean> = _isSearching.asStateFlow()
 
+    // Recenter map event
+    val recenterEvent = MutableStateFlow<Long>(0L)
+
+    fun recenterMap() {
+        recenterEvent.value = System.currentTimeMillis()
+    }
+
     // UI Sheets / Dialogs
-    val showRoutePlannerSheet = MutableStateFlow(true)
+    val showRoutePlannerSheet = MutableStateFlow(false) // Start with full map view & compact bottom bar
     val showSearchDialogForIndex = MutableStateFlow<Int?>(null)
     val showCockpitDialog = MutableStateFlow(false)
     val showRangeCircle = MutableStateFlow(true)

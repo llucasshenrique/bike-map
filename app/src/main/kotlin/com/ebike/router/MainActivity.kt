@@ -7,7 +7,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -71,6 +76,8 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun MainScreen(viewModel: BikeMapViewModel) {
+    var showSplash by remember { mutableStateOf(true) }
+
     val isNavigating by viewModel.isNavigating.collectAsState()
     val showPlannerSheet by viewModel.showRoutePlannerSheet.collectAsState()
     val searchDialogIndex by viewModel.showSearchDialogForIndex.collectAsState()
@@ -84,7 +91,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
     var showMapClickMenuForPoint by remember { mutableStateOf<com.ebike.router.model.GeoPoint?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // Base OpenStreetMap Layer
+        // 1. BASE MAP LAYER (Osmdroid with elevation-colored polylines & multi-stop pins)
         OsmdroidMapView(
             viewModel = viewModel,
             onMapClick = { clickedPoint ->
@@ -92,60 +99,125 @@ fun MainScreen(viewModel: BikeMapViewModel) {
             }
         )
 
-        // Floating Map Controls (Top-Right)
+        // 2. FLOATING TOP BAR (Search & Quick Status)
         if (!isNavigating) {
-            Column(
+            Row(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                // Route Planner Toggle
-                FloatingActionButton(
-                    onClick = { viewModel.showRoutePlannerSheet.value = !showPlannerSheet },
-                    containerColor = Slate900,
-                    contentColor = CyanGlow,
-                    shape = CircleShape
+                // Search destination pill
+                Surface(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .clickable { viewModel.showSearchDialogForIndex.value = max(1, waypoints.size - 1) },
+                    shape = RoundedCornerShape(24.dp),
+                    color = Slate900.copy(alpha = 0.95f),
+                    shadowElevation = 8.dp,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Slate700)
                 ) {
-                    Icon(Icons.Default.Route, contentDescription = "Rotas")
+                    Row(
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(Icons.Default.Search, contentDescription = "Buscar", tint = CyanGlow, modifier = Modifier.size(20.dp))
+                        Text(
+                            text = "Para onde vamos pedalar?",
+                            color = Slate400,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1
+                        )
+                    }
                 }
 
-                // Cockpit Button
-                FloatingActionButton(
-                    onClick = { viewModel.showCockpitDialog.value = true },
-                    containerColor = Slate900,
-                    contentColor = EmeraldGreen,
-                    shape = CircleShape
+                // Battery / Cockpit Pill
+                Surface(
+                    modifier = Modifier
+                        .height(48.dp)
+                        .clickable { viewModel.showCockpitDialog.value = true },
+                    shape = RoundedCornerShape(24.dp),
+                    color = Slate900.copy(alpha = 0.95f),
+                    shadowElevation = 8.dp,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Slate700)
                 ) {
-                    Icon(Icons.Default.DirectionsBike, contentDescription = "Cockpit")
-                }
-            }
-        }
-
-        // Grade Legend Bar (Bottom-Left when route is active and not navigating)
-        if (activeRoute != null && !isNavigating) {
-            Card(
-                modifier = Modifier
-                    .align(Alignment.BottomStart)
-                    .padding(16.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = Slate900.copy(alpha = 0.9f))
-            ) {
-                Column(modifier = Modifier.padding(8.dp)) {
-                    Text("INCLINAÇÃO / GRAU:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Slate400)
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("🔵 Descida", fontSize = 10.sp, color = SlopeDownhill, fontWeight = FontWeight.Bold)
-                        Text("🟢 0-3% Plano", fontSize = 10.sp, color = SlopeFlat, fontWeight = FontWeight.Bold)
-                        Text("🟡 3-7% Médio", fontSize = 10.sp, color = SlopeModerate, fontWeight = FontWeight.Bold)
-                        Text("🔴 >7% Subida", fontSize = 10.sp, color = SlopeSteep, fontWeight = FontWeight.Bold)
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Default.ElectricBike, contentDescription = null, tint = EmeraldGreen, modifier = Modifier.size(18.dp))
+                        Text(
+                            text = "${telemetry.batteryTelemetry.percentage}%",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = EmeraldGreen
+                        )
+                        Text(
+                            text = telemetry.activeAssist.name,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Black,
+                            color = CyanGlow
+                        )
                     }
                 }
             }
         }
 
-        // Navigation HUD (When Navigating)
+        // 3. FLOATING GRADE LEGEND (Bottom-Left when route is active and not navigating)
+        if (activeRoute != null && !isNavigating && !showPlannerSheet) {
+            Card(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(start = 16.dp, bottom = 180.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = Slate900.copy(alpha = 0.92f)),
+                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    Text("INCLINAÇÃO:", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Slate400)
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("🔵 <0%", fontSize = 10.sp, color = SlopeDownhill, fontWeight = FontWeight.Bold)
+                        Text("🟢 0-3%", fontSize = 10.sp, color = SlopeFlat, fontWeight = FontWeight.Bold)
+                        Text("🟡 3-7%", fontSize = 10.sp, color = SlopeModerate, fontWeight = FontWeight.Bold)
+                        Text("🔴 >7%", fontSize = 10.sp, color = SlopeSteep, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+        }
+
+        // 4. ⭐ ALWAYS-VISIBLE RECENTER BUTTON ⭐
+        // Positioned prominently on the right side, floating above any bottom controls or sheets
+        val recenterBottomPadding = if (isNavigating) 180.dp else if (showPlannerSheet) 90.dp else 160.dp
+        FloatingActionButton(
+            onClick = { viewModel.recenterMap() },
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(end = 16.dp, bottom = recenterBottomPadding)
+                .size(54.dp)
+                .border(2.dp, CyanGlow, CircleShape),
+            containerColor = Slate900,
+            contentColor = CyanGlow,
+            shape = CircleShape,
+            elevation = FloatingActionButtonDefaults.elevation(defaultElevation = 10.dp)
+        ) {
+            Icon(
+                Icons.Default.MyLocation,
+                contentDescription = "Recentralizar no GPS",
+                modifier = Modifier.size(26.dp)
+            )
+        }
+
+        // 5. BOTTOM CARDS / NAVIGATION OVERLAY
         if (isNavigating) {
+            // Full Turn-by-Turn HUD
             val curInstruction by viewModel.currentInstruction.collectAsState()
             val distToNextManeuver by viewModel.distanceToNextManeuverMeters.collectAsState()
 
@@ -160,9 +232,114 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                 onStopNavigation = { viewModel.stopNavigation() },
                 onOpenCockpit = { viewModel.showCockpitDialog.value = true }
             )
+        } else if (!showPlannerSheet) {
+            // COMPACT BOTTOM CONTROLS (When Planner is minimized)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .align(Alignment.BottomCenter)
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // If route already calculated: Quick Action Preview Bar
+                activeRoute?.let { route ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(containerColor = Slate900.copy(alpha = 0.95f)),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 10.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(text = route.name, fontWeight = FontWeight.Bold, color = Color.White, fontSize = 14.sp)
+                                    Text(
+                                        text = "${(route.totalDistanceMeters / 1000.0 * 10).toInt() / 10.0} km • ${route.totalDurationSeconds / 60} min • -${route.totalEnergyWh} Wh",
+                                        color = CyanGlow,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { viewModel.showRoutePlannerSheet.value = true },
+                                    modifier = Modifier.size(36.dp).background(Slate800, CircleShape)
+                                ) {
+                                    Icon(Icons.Default.Edit, contentDescription = "Editar", tint = Slate400, modifier = Modifier.size(18.dp))
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { viewModel.startNavigation(route) },
+                                    modifier = Modifier.weight(1.2f).height(46.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = EmeraldGreen, contentColor = Slate950),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("NAVEGAR", fontWeight = FontWeight.Black)
+                                }
+
+                                Button(
+                                    onClick = { viewModel.startSimulation(2) },
+                                    modifier = Modifier.weight(1f).height(46.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Slate800, contentColor = CyanGlow),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("SIMULAR", fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // If no route calculated yet: Floating Explorer Buttons
+                if (activeRoute == null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Button(
+                            onClick = { viewModel.showRoutePlannerSheet.value = true },
+                            modifier = Modifier.weight(1.3f).height(50.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary, contentColor = Slate950),
+                            shape = RoundedCornerShape(16.dp),
+                            elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp)
+                        ) {
+                            Icon(Icons.Default.Route, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("PLANEJAR ROTA", fontWeight = FontWeight.Black, fontSize = 13.sp)
+                        }
+
+                        Button(
+                            onClick = { viewModel.showCockpitDialog.value = true },
+                            modifier = Modifier.weight(1f).height(50.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Slate900, contentColor = EmeraldGreen),
+                            shape = RoundedCornerShape(16.dp),
+                            border = androidx.compose.foundation.BorderStroke(1.dp, Slate700),
+                            elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp)
+                        ) {
+                            Icon(Icons.Default.DirectionsBike, contentDescription = null)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("COCKPIT", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                        }
+                    }
+                }
+            }
         }
 
-        // Route Planner Sheet (When Not Navigating and Visible)
+        // 6. FULL ROUTE PLANNER SHEET (When Expanded)
         if (!isNavigating && showPlannerSheet) {
             val availableRoutes by viewModel.availableRoutes.collectAsState()
             val selectedRouteIdx by viewModel.selectedRouteIndex.collectAsState()
@@ -196,7 +373,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
             }
         }
 
-        // Map Tap Location Context Menu
+        // 7. MAP TAP CONTEXT MENU
         showMapClickMenuForPoint?.let { clickedPt ->
             AlertDialog(
                 onDismissRequest = { showMapClickMenuForPoint = null },
@@ -245,7 +422,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
             )
         }
 
-        // Search Dialog
+        // 8. SEARCH DIALOG
         searchDialogIndex?.let { targetIdx ->
             val targetWp = waypoints.getOrNull(targetIdx)
             WaypointSearchDialog(
@@ -260,12 +437,19 @@ fun MainScreen(viewModel: BikeMapViewModel) {
             )
         }
 
-        // Cockpit Bike Computer Dialog
+        // 9. COCKPIT DIALOG
         if (showCockpit) {
             TelemetryCockpitDialog(
                 telemetry = telemetry,
                 onSelectAssist = { viewModel.setAssistLevel(it) },
                 onDismiss = { viewModel.showCockpitDialog.value = false }
+            )
+        }
+
+        // 10. SPLASH SCREEN OVERLAY (Smooth launch animation)
+        if (showSplash) {
+            SplashScreenOverlay(
+                onSplashFinished = { showSplash = false }
             )
         }
     }

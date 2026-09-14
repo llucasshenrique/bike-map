@@ -191,6 +191,17 @@ fun OsmdroidMapView(
         }
     )
 
+    val recenterEvent by viewModel.recenterEvent.collectAsState()
+
+    // Recenter map when triggered
+    LaunchedEffect(recenterEvent) {
+        if (recenterEvent > 0L) {
+            val map = mapViewRef ?: return@LaunchedEffect
+            val riderPoint = OsmGeoPoint(locationState.point.lat, locationState.point.lng)
+            map.controller.animateTo(riderPoint, 16.5, 600L)
+        }
+    }
+
     // Zoom to route bounds when calculated
     LaunchedEffect(activeRoute?.id) {
         val route = activeRoute ?: return@LaunchedEffect
