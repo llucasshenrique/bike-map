@@ -1,7 +1,16 @@
 package com.ebike.router.service
 
+import android.content.Context
+import com.ebike.router.data.dem.SrtmTileManager
+import com.ebike.router.data.local.ElevationDatabase
 import com.ebike.router.model.*
 import com.ebike.router.physics.EBikePhysicsEngine
+import com.ebike.router.service.elevation.CompositeElevationProvider
+import com.ebike.router.service.elevation.ElevationProvider
+import com.ebike.router.service.elevation.ElevationSampler
+import com.ebike.router.service.elevation.ElevationSmoother
+import com.ebike.router.service.elevation.RemoteElevationProvider
+import com.ebike.router.service.elevation.SrtmElevationProvider
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import kotlinx.coroutines.Dispatchers
@@ -12,7 +21,8 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.*
 
 class GraphRouterService(
-    private val physicsEngine: EBikePhysicsEngine
+    private val physicsEngine: EBikePhysicsEngine,
+    context: Context
 ) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(7, TimeUnit.SECONDS)
@@ -20,6 +30,12 @@ class GraphRouterService(
         .build()
 
     private val gson = Gson()
+
+    private val elevationProvider: ElevationProvider = CompositeElevationProvider(
+        database = ElevationDatabase(context.applicationContext),
+        srtmProvider = SrtmElevationProvider(SrtmTileManager(context.applicationContext)),
+        remoteProvider = RemoteElevationProvider()
+    )
 
     suspend fun calculateMultipleRoutes(
         points: List<GeoPoint>,
@@ -31,7 +47,7 @@ class GraphRouterService(
         try {
             val osmRoutes = fetchOSMBikeRoutes(points, profile)
             if (osmRoutes.isNotEmpty()) {
-                return@withContext osmRoutes
+                return@withContext RouteClassifier.classify(osmRoutes)
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -42,7 +58,7 @@ class GraphRouterService(
         return@withContext listOf(directRoute)
     }
 
-    private fun fetchOSMBikeRoutes(
+    private suspend fun fetchOSMBikeRoutes(
         points: List<GeoPoint>,
         profile: RoutingProfile
     ): List<RouteResult> {
@@ -84,7 +100,18 @@ class GraphRouterService(
         return results
     }
 
-    private fun parseSingleRoute(
+    /** Raw per-step data collected before real elevation/grade is resolved. */
+    private data class StepData(
+        val stepIdx: Int,
+        val stepDist: Double,
+        val stepName: String,
+        val stepCoords: List<GeoPoint>,
+        val maneuverObj: JsonObject?,
+        val startGeomDistM: Double,
+        val endGeomDistM: Double
+    )
+
+    private suspend fun parseSingleRoute(
         routeObj: JsonObject,
         startPoint: GeoPoint,
         endPoint: GeoPoint,
@@ -101,7 +128,7 @@ class GraphRouterService(
                 val arr = elem.asJsonArray
                 val lng = arr.get(0).asDouble
                 val lat = arr.get(1).asDouble
-                allCoords.add(GeoPoint(lat, lng, 20.0))
+                allCoords.add(GeoPoint(lat, lng))
             }
         }
         if (allCoords.isNotEmpty()) {
@@ -109,22 +136,14 @@ class GraphRouterService(
             allCoords[allCoords.size - 1] = endPoint
         }
 
-        val segments = mutableListOf<RouteSegment>()
-        val instructions = mutableListOf<TurnInstruction>()
-        val elevationProfile = mutableListOf<ElevationPoint>()
-
-        var totalDistM = 0.0
-        var totalDurationSec = 0
-        var totalEnergyWh = 0.0
-        var eleGainM = 0
-        var eleLossM = 0
-        var maxGrade = 0.0
-        var totalGradeSum = 0.0
-
-        elevationProfile.add(ElevationPoint(0.0, startPoint.ele, 0.0, startPoint.lat, startPoint.lng))
-
+        // First pass: walk every leg/step, recording raw step metadata and
+        // concatenating step geometries into one polyline used to sample
+        // real ground elevation along the whole route.
+        val fullRouteCoords = mutableListOf<GeoPoint>()
+        val anchorIndices = mutableSetOf<Int>()
+        val stepDataList = mutableListOf<StepData>()
+        var geomCumDist = 0.0
         var stepIdx = 0
-        val slopeMultiplier = if (routeIndex == 0) 1.0 else if (routeIndex == 1) 0.6 else 1.3
 
         if (legsArray != null) {
             for (l in 0 until legsArray.size()) {
@@ -143,67 +162,124 @@ class GraphRouterService(
                     if (stepCoordsArr != null) {
                         for (coord in stepCoordsArr) {
                             val c = coord.asJsonArray
-                            stepCoords.add(GeoPoint(c.get(1).asDouble, c.get(0).asDouble, 20.0))
+                            stepCoords.add(GeoPoint(c.get(1).asDouble, c.get(0).asDouble))
                         }
                     }
+                    if (stepCoords.isNotEmpty() && stepIdx == 0) {
+                        stepCoords[0] = startPoint
+                    }
 
-                    val stepGrade = ((sin(stepIdx * 1.4 + routeIndex) * (if (profile == RoutingProfile.TURBO) 4.5 else 2.8) * slopeMultiplier) * 10).roundToInt() / 10.0
-                    val stepEleDiff = ((stepDist * stepGrade) / 100.0).roundToInt()
-
-                    totalDistM += stepDist
-                    if (stepEleDiff > 0) eleGainM += stepEleDiff else eleLossM += abs(stepEleDiff)
-                    maxGrade = max(maxGrade, abs(stepGrade))
-                    totalGradeSum += abs(stepGrade)
-
-                    val cruisingSpeed = if (profile == RoutingProfile.TURBO) 30.0 else if (profile == RoutingProfile.SAFE) 22.0 else 26.0
-                    val energyResult = physicsEngine.calculateSegmentEnergy(stepDist, stepGrade, cruisingSpeed)
-                    totalDurationSec += energyResult.durationSeconds
-                    totalEnergyWh += energyResult.energyWh
+                    anchorIndices.add(fullRouteCoords.size)
+                    val startGeomDist = geomCumDist
+                    for (i in stepCoords.indices) {
+                        if (i == 0 && fullRouteCoords.isNotEmpty()) {
+                            geomCumDist += fullRouteCoords.last().distanceTo(stepCoords[i])
+                        } else if (i > 0) {
+                            geomCumDist += stepCoords[i - 1].distanceTo(stepCoords[i])
+                        }
+                        fullRouteCoords.add(stepCoords[i])
+                    }
+                    val endGeomDist = geomCumDist
 
                     val maneuverObj = step.getAsJsonObject("maneuver")
-                    val maneuverType = mapManeuver(maneuverObj?.get("type")?.asString, maneuverObj?.get("modifier")?.asString, stepIdx, steps.size(), stepGrade)
-                    val maneuverText = formatManeuverText(maneuverType, stepName, stepDist.toInt())
-
-                    val anchorPoint = stepCoords.firstOrNull() ?: allCoords.getOrElse(min(stepIdx, allCoords.size - 1)) { startPoint }
-
-                    instructions.add(
-                        TurnInstruction(
-                            index = stepIdx,
-                            maneuver = maneuverType,
-                            text = maneuverText,
-                            streetName = stepName,
-                            distanceMeters = stepDist.roundToInt(),
-                            durationSeconds = energyResult.durationSeconds,
-                            point = anchorPoint,
-                            gradePercent = stepGrade,
-                            energyWh = energyResult.energyWh,
-                            cumulativeDistanceKm = (totalDistM / 1000.0 * 100).roundToInt() / 100.0
-                        )
+                    stepDataList.add(
+                        StepData(stepIdx, stepDist, stepName, stepCoords, maneuverObj, startGeomDist, endGeomDist)
                     )
-
-                    segments.add(
-                        RouteSegment(
-                            fromNodeId = "seg_${stepIdx}",
-                            toNodeId = "seg_${stepIdx + 1}",
-                            name = stepName,
-                            distanceMeters = stepDist.roundToInt(),
-                            gradePercent = stepGrade,
-                            elevationGainM = max(0, stepEleDiff),
-                            elevationLossM = max(0, -stepEleDiff),
-                            coordinates = if (stepCoords.isNotEmpty()) stepCoords else listOf(anchorPoint),
-                            estimatedEnergyWh = energyResult.energyWh,
-                            estimatedTimeSeconds = energyResult.durationSeconds
-                        )
-                    )
-
-                    val cumDistKm = (totalDistM / 1000.0 * 100).roundToInt() / 100.0
-                    val currentEle = max(5.0, startPoint.ele + eleGainM - eleLossM)
-                    val lastPt = stepCoords.lastOrNull() ?: anchorPoint
-                    elevationProfile.add(ElevationPoint(cumDistKm, currentEle, stepGrade, lastPt.lat, lastPt.lng))
-
                     stepIdx++
                 }
             }
+        }
+        if (fullRouteCoords.isNotEmpty()) {
+            fullRouteCoords[fullRouteCoords.size - 1] = endPoint
+        }
+
+        val sampler = ElevationSampler.build(
+            routeCoords = fullRouteCoords.ifEmpty { listOf(startPoint, endPoint) },
+            anchorIndices = anchorIndices,
+            provider = elevationProvider
+        )
+
+        val startEle = sampler.elevationAt(0.0)
+        val resolvedStart = startPoint.copy(ele = startEle)
+        if (allCoords.isNotEmpty()) allCoords[0] = resolvedStart
+
+        // Second pass: derive real grade/energy/instructions/segments from
+        // the sampled + smoothed elevation profile.
+        val segments = mutableListOf<RouteSegment>()
+        val instructions = mutableListOf<TurnInstruction>()
+        val elevationProfile = mutableListOf<ElevationPoint>()
+
+        var totalDistM = 0.0
+        var totalDurationSec = 0
+        var totalEnergyWh = 0.0
+        var maxGrade = 0.0
+        var totalGradeSum = 0.0
+
+        elevationProfile.add(ElevationPoint(0.0, startEle, 0.0, resolvedStart.lat, resolvedStart.lng))
+
+        for (data in stepDataList) {
+            val eleStart = sampler.elevationAt(data.startGeomDistM)
+            val eleEnd = sampler.elevationAt(data.endGeomDistM)
+            val stepEleDiff = eleEnd - eleStart
+            val stepGrade = ElevationSmoother.gradePercent(stepEleDiff, max(data.stepDist, 1.0))
+
+            totalDistM += data.stepDist
+            maxGrade = max(maxGrade, abs(stepGrade))
+            totalGradeSum += abs(stepGrade)
+
+            val cruisingSpeed = if (profile == RoutingProfile.TURBO) 30.0 else if (profile == RoutingProfile.SAFE) 22.0 else 26.0
+            val energyResult = physicsEngine.calculateSegmentEnergy(data.stepDist, stepGrade, cruisingSpeed)
+            totalDurationSec += energyResult.durationSeconds
+            totalEnergyWh += energyResult.energyWh
+
+            val maneuverType = mapManeuver(
+                data.maneuverObj?.get("type")?.asString,
+                data.maneuverObj?.get("modifier")?.asString,
+                data.stepIdx,
+                stepDataList.size,
+                stepGrade
+            )
+            val maneuverText = formatManeuverText(maneuverType, data.stepName, data.stepDist.toInt())
+
+            val anchorPoint = data.stepCoords.firstOrNull()
+                ?: allCoords.getOrElse(min(data.stepIdx, allCoords.size - 1)) { resolvedStart }
+
+            instructions.add(
+                TurnInstruction(
+                    index = data.stepIdx,
+                    maneuver = maneuverType,
+                    text = maneuverText,
+                    streetName = data.stepName,
+                    distanceMeters = data.stepDist.roundToInt(),
+                    durationSeconds = energyResult.durationSeconds,
+                    point = anchorPoint,
+                    gradePercent = stepGrade,
+                    energyWh = energyResult.energyWh,
+                    cumulativeDistanceKm = (totalDistM / 1000.0 * 100).roundToInt() / 100.0
+                )
+            )
+
+            val stepEleGain = max(0.0, stepEleDiff).roundToInt()
+            val stepEleLoss = max(0.0, -stepEleDiff).roundToInt()
+
+            segments.add(
+                RouteSegment(
+                    fromNodeId = "seg_${data.stepIdx}",
+                    toNodeId = "seg_${data.stepIdx + 1}",
+                    name = data.stepName,
+                    distanceMeters = data.stepDist.roundToInt(),
+                    gradePercent = stepGrade,
+                    elevationGainM = stepEleGain,
+                    elevationLossM = stepEleLoss,
+                    coordinates = if (data.stepCoords.isNotEmpty()) data.stepCoords else listOf(anchorPoint),
+                    estimatedEnergyWh = energyResult.energyWh,
+                    estimatedTimeSeconds = energyResult.durationSeconds
+                )
+            )
+
+            val cumDistKm = (totalDistM / 1000.0 * 100).roundToInt() / 100.0
+            val lastPt = data.stepCoords.lastOrNull() ?: anchorPoint
+            elevationProfile.add(ElevationPoint(cumDistKm, eleEnd, stepGrade, lastPt.lat, lastPt.lng))
         }
 
         val finalDistM = max(routeObj.get("distance")?.asDouble ?: totalDistM, 20.0).roundToInt()
@@ -213,32 +289,18 @@ class GraphRouterService(
         val drainPct = ((finalEnergy / batCap) * 1000).roundToInt() / 10.0
         val remWh = max(0.0, curBat - finalEnergy).roundToInt()
         val remPct = max(0, ((remWh / batCap) * 100).roundToInt())
-        val avgGrade = if (stepIdx > 0) ((totalGradeSum / stepIdx) * 10).roundToInt() / 10.0 else 0.0
-
-        val firstLegSummary = legsArray?.firstOrNull()?.asJsonObject?.get("summary")?.asString?.ifBlank { null }
-        val viaText = if (firstLegSummary != null) " via $firstLegSummary" else ""
-
-        val routeTitles = listOf(
-            "Rota Mais Rápida$viaText",
-            "Caminho Mais Plano (Eco)$viaText",
-            "Ciclovia Cênica$viaText"
-        )
-        val routeSummaries = listOf(
-            "Melhor equilíbrio entre velocidade e autonomia",
-            "Menos subidas, elevação suave e economia de bateria",
-            "Prioridade para ciclovias e vias tranquilas"
-        )
+        val avgGrade = if (stepDataList.isNotEmpty()) ((totalGradeSum / stepDataList.size) * 10).roundToInt() / 10.0 else 0.0
 
         return RouteResult(
             id = "route_${System.currentTimeMillis()}_$routeIndex",
-            name = routeTitles.getOrElse(routeIndex) { "Opção ${routeIndex + 1}$viaText" },
-            summary = routeSummaries.getOrElse(routeIndex) { "Rota alternativa recomendada" },
+            name = "Opção ${routeIndex + 1}",
+            summary = "Rota alternativa recomendada",
             profile = profile,
             totalDistanceMeters = finalDistM,
             totalDurationSeconds = max(totalDurationSec, (routeObj.get("duration")?.asDouble ?: 60.0).roundToInt()),
             totalEnergyWh = finalEnergy,
-            elevationGainM = eleGainM,
-            elevationLossM = eleLossM,
+            elevationGainM = sampler.elevationGainM,
+            elevationLossM = sampler.elevationLossM,
             maxGradePercent = (maxGrade * 10).roundToInt() / 10.0,
             avgGradePercent = avgGrade,
             coordinates = allCoords,
@@ -290,19 +352,19 @@ class GraphRouterService(
         return RouteResult(
             id = "direct_${System.currentTimeMillis()}",
             name = "Rota Direta Estimada",
-            summary = "Conexão direta entre os pontos selecionados",
+            summary = "Conexão direta entre os pontos selecionados (sem dados de elevação)",
             profile = profile,
             totalDistanceMeters = totalDistM,
             totalDurationSeconds = durationSec,
             totalEnergyWh = energyResult.energyWh,
-            elevationGainM = 15,
-            elevationLossM = 10,
-            maxGradePercent = 2.0,
-            avgGradePercent = 0.5,
+            elevationGainM = 0,
+            elevationLossM = 0,
+            maxGradePercent = 0.0,
+            avgGradePercent = 0.0,
             coordinates = points,
             elevationProfile = listOf(
-                ElevationPoint(0.0, 20.0, 0.0, points.first().lat, points.first().lng),
-                ElevationPoint(totalDistM / 1000.0, 25.0, 0.0, points.last().lat, points.last().lng)
+                ElevationPoint(0.0, points.first().ele, 0.0, points.first().lat, points.first().lng),
+                ElevationPoint(totalDistM / 1000.0, points.first().ele, 0.0, points.last().lat, points.last().lng)
             ),
             instructions = instructions,
             segments = listOf(
@@ -312,16 +374,16 @@ class GraphRouterService(
                     name = "Trajeto E-Bike",
                     distanceMeters = totalDistM,
                     gradePercent = 0.0,
-                    elevationGainM = 15,
-                    elevationLossM = 10,
+                    elevationGainM = 0,
+                    elevationLossM = 0,
                     coordinates = points,
                     estimatedEnergyWh = energyResult.energyWh,
                     estimatedTimeSeconds = durationSec
                 )
             ),
-            batteryDrainPercent = 2.5,
-            estimatedBatteryRemainingWh = 540,
-            batteryRemainingPercent = 88
+            batteryDrainPercent = 0.0,
+            estimatedBatteryRemainingWh = physicsEngine.getConfig().currentBatteryWh.roundToInt(),
+            batteryRemainingPercent = 100
         )
     }
 
