@@ -88,6 +88,12 @@ fun MainScreen(viewModel: BikeMapViewModel) {
     val telemetry by viewModel.telemetry.collectAsState()
     val waypoints by viewModel.waypoints.collectAsState()
 
+    val showHistorySheet by viewModel.showHistorySheet.collectAsState()
+    val completedRideSummary by viewModel.completedRideSummary.collectAsState()
+    val rideHistory by viewModel.rideHistory.collectAsState()
+    val savedRoutes by viewModel.savedRoutes.collectAsState()
+    val savedDestinations by viewModel.savedDestinations.collectAsState()
+
     var showMapClickMenuForPoint by remember { mutableStateOf<com.ebike.router.model.GeoPoint?>(null) }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -133,6 +139,31 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium,
                             maxLines = 1
+                        )
+                    }
+                }
+
+                // History & Saved Pill
+                Surface(
+                    modifier = Modifier
+                        .height(48.dp)
+                        .clickable { viewModel.showHistorySheet.value = true },
+                    shape = RoundedCornerShape(24.dp),
+                    color = Slate900.copy(alpha = 0.95f),
+                    shadowElevation = 8.dp,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Slate700)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Default.Bookmark, contentDescription = "Salvos & Histórico", tint = AmberWarning, modifier = Modifier.size(18.dp))
+                        Text(
+                            text = "Salvos",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
                         )
                     }
                 }
@@ -368,6 +399,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                     onSelectRoute = { viewModel.selectRoute(it) },
                     onStartNavigation = { viewModel.startNavigation(it) },
                     onStartSimulation = { viewModel.startSimulation(2) },
+                    onSaveRoute = { viewModel.saveCurrentRoute() },
                     onClose = { viewModel.showRoutePlannerSheet.value = false }
                 )
             }
@@ -416,6 +448,19 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                         ) {
                             Text("Destino")
                         }
+                        Button(
+                            onClick = {
+                                viewModel.saveDestination(
+                                    label = "Ponto Marcado",
+                                    point = clickedPt,
+                                    address = "${(clickedPt.lat * 1000).toInt() / 1000.0}, ${(clickedPt.lng * 1000).toInt() / 1000.0}"
+                                )
+                                showMapClickMenuForPoint = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary, contentColor = Slate950)
+                        ) {
+                            Text("★ Salvar")
+                        }
                     }
                 },
                 containerColor = Slate900
@@ -433,11 +478,48 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                 onSearch = { viewModel.searchPlaces(it) },
                 onSelectResult = { viewModel.selectSearchResult(targetIdx, it) },
                 onUseGps = { viewModel.useGpsForWaypoint(targetIdx) },
+                savedDestinations = savedDestinations,
+                onSelectSavedDestination = { viewModel.selectDestinationAsWaypoint(targetIdx, it) },
+                onSaveSearchResultAsFavorite = { viewModel.saveDestination(it.name, it.point, it.subText) },
                 onDismiss = { viewModel.showSearchDialogForIndex.value = null }
             )
         }
 
-        // 9. COCKPIT DIALOG
+        // 9. RIDE HISTORY & SAVED ROUTES SHEET
+        if (showHistorySheet) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                RideHistorySheet(
+                    rides = rideHistory,
+                    savedRoutes = savedRoutes,
+                    savedDestinations = savedDestinations,
+                    onPreviewRide = { viewModel.previewRideOnMap(it) },
+                    onRenameRide = { id, name -> viewModel.renameRide(id, name) },
+                    onDeleteRide = { viewModel.deleteRide(it) },
+                    onLoadRoute = { viewModel.loadSavedRoute(it) },
+                    onRenameRoute = { id, name -> viewModel.renameSavedRoute(id, name) },
+                    onDeleteRoute = { viewModel.deleteSavedRoute(it) },
+                    onSelectDestination = {
+                        val targetIdx = max(1, waypoints.size - 1)
+                        viewModel.selectDestinationAsWaypoint(targetIdx, it)
+                        viewModel.showHistorySheet.value = false
+                    },
+                    onRenameDestination = { id, name -> viewModel.renameDestination(id, name) },
+                    onDeleteDestination = { viewModel.deleteDestination(it) },
+                    onClose = { viewModel.showHistorySheet.value = false }
+                )
+            }
+        }
+
+        // 10. POST-RIDE SUMMARY DIALOG
+        completedRideSummary?.let { ride ->
+            RideSummaryDialog(
+                ride = ride,
+                onSave = { customTitle -> viewModel.saveCompletedRide(customTitle) },
+                onDiscard = { viewModel.discardCompletedRide() }
+            )
+        }
+
+        // 11. COCKPIT DIALOG
         if (showCockpit) {
             TelemetryCockpitDialog(
                 telemetry = telemetry,
