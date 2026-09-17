@@ -1,7 +1,9 @@
 package com.ebike.router
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -28,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlin.math.max
+import com.ebike.router.service.LocationTrackerService
 import com.ebike.router.ui.components.*
 import com.ebike.router.ui.theme.*
 import com.ebike.router.ui.viewmodel.BikeMapViewModel
@@ -38,16 +41,17 @@ class MainActivity : ComponentActivity() {
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        ) {
-            viewModel.locationTracker.startTracking()
+        val fineGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        val coarseGranted = permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+
+        if (fineGranted || coarseGranted) {
+            startAndBindTrackerService()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        checkLocationPermissions()
+        checkAndRequestPermissions()
 
         setContent {
             EBikeMapTheme {
@@ -56,21 +60,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun checkLocationPermissions() {
-        val fineLocationGranted = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-
-        if (!fineLocationGranted) {
-            requestPermissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
-                )
-            )
-        } else {
-            viewModel.locationTracker.startTracking()
+    private fun checkAndRequestPermissions() {
+        val permissionsToRequest = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+
+        val missing = permissionsToRequest.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isNotEmpty()) {
+            requestPermissionLauncher.launch(missing.toTypedArray())
+        } else {
+            startAndBindTrackerService()
+        }
+    }
+
+    private fun startAndBindTrackerService() {
+        val serviceIntent = Intent(this, LocationTrackerService::class.java).apply {
+            action = LocationTrackerService.ACTION_START_TRACKING
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+        viewModel.bindService(this)
     }
 }
 
@@ -227,7 +242,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                 telemetry = telemetry,
                 isMuted = viewModel.audioGuidance.isMuted,
                 onToggleMute = {
-                    viewModel.audioGuidance.isMuted = !viewModel.audioGuidance.isMuted
+                    viewModel.setAudioMuted(!viewModel.audioGuidance.isMuted)
                 },
                 onStopNavigation = { viewModel.stopNavigation() },
                 onOpenCockpit = { viewModel.showCockpitDialog.value = true }

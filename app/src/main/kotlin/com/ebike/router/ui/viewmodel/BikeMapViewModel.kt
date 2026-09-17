@@ -1,6 +1,12 @@
 package com.ebike.router.ui.viewmodel
 
 import android.app.Application
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ebike.router.model.*
@@ -9,21 +15,58 @@ import com.ebike.router.service.AudioGuidanceService
 import com.ebike.router.service.GeocodingService
 import com.ebike.router.service.GraphRouterService
 import com.ebike.router.service.LocationTrackerService
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import com.ebike.router.service.RiderLocationState
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.max
-import kotlin.math.min
 
 class BikeMapViewModel(application: Application) : AndroidViewModel(application) {
     val physicsEngine = EBikePhysicsEngine()
     val routerService = GraphRouterService(physicsEngine)
     val geocodingService = GeocodingService()
     val audioGuidance = AudioGuidanceService(application)
-    val locationTracker = LocationTrackerService(application)
+
+    // Service binding state
+    private var serviceConnection: ServiceConnection? = null
+    private val _trackerService = MutableStateFlow<LocationTrackerService?>(null)
+    val trackerService: StateFlow<LocationTrackerService?> = _trackerService.asStateFlow()
+
+    // Location state exposed for UI
+    private val _locationState = MutableStateFlow(RiderLocationState())
+    val locationState: StateFlow<RiderLocationState> = _locationState.asStateFlow()
+
+    // Backward-compatible locationTracker accessor for existing UI calls
+    inner class LocationTrackerCompat {
+        val locationState: StateFlow<RiderLocationState> get() = this@BikeMapViewModel.locationState
+        fun startTracking() {
+            val app = getApplication<Application>()
+            val intent = Intent(app, LocationTrackerService::class.java).apply {
+                action = LocationTrackerService.ACTION_START_TRACKING
+            }
+            ContextCompat.startForegroundService(app, intent)
+            _trackerService.value?.startTracking()
+        }
+        fun stopTracking() {
+            val app = getApplication<Application>()
+            val intent = Intent(app, LocationTrackerService::class.java).apply {
+                action = LocationTrackerService.ACTION_STOP_TRACKING
+            }
+            app.startService(intent)
+            _trackerService.value?.stopTracking()
+        }
+        fun refreshCurrentLocation() {
+            _trackerService.value?.refreshCurrentLocation()
+        }
+        fun startSimulator(route: RouteResult, speedMultiplier: Int = 2) {
+            _trackerService.value?.startSimulator(route, speedMultiplier)
+        }
+        fun stopSimulator() {
+            _trackerService.value?.stopSimulator()
+        }
+    }
+    val locationTracker = LocationTrackerCompat()
 
     // Waypoints
     private val _waypoints = MutableStateFlow<List<RouteWaypoint>>(
@@ -85,23 +128,75 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     }
 
     // UI Sheets / Dialogs
-    val showRoutePlannerSheet = MutableStateFlow(false) // Start with full map view & compact bottom bar
+    val showRoutePlannerSheet = MutableStateFlow(false)
     val showSearchDialogForIndex = MutableStateFlow<Int?>(null)
     val showCockpitDialog = MutableStateFlow(false)
     val showRangeCircle = MutableStateFlow(true)
 
-    private var rideTimerJob: Job? = null
     private val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
     init {
-        locationTracker.startTracking()
+        bindService(application)
+    }
 
-        // Follow user location changes
-        viewModelScope.launch {
-            locationTracker.locationState.collect { locState ->
-                handleRiderLocationUpdate(locState.point, locState.speedKmh, locState.headingDegrees)
+    fun bindService(context: Context) {
+        if (serviceConnection != null) return
+
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                val binder = service as? LocationTrackerService.LocalBinder
+                val svc = binder?.getService()
+                _trackerService.value = svc
+
+                svc?.let { s ->
+                    viewModelScope.launch {
+                        s.locationState.collect { loc ->
+                            _locationState.value = loc
+                        }
+                    }
+                    viewModelScope.launch {
+                        s.telemetry.collect { telem ->
+                            _telemetry.value = telem
+                        }
+                    }
+                    viewModelScope.launch {
+                        s.isNavigating.collect { nav ->
+                            _isNavigating.value = nav
+                        }
+                    }
+                    viewModelScope.launch {
+                        s.currentInstruction.collect { instruction ->
+                            _currentInstruction.value = instruction
+                        }
+                    }
+                    viewModelScope.launch {
+                        s.distanceToNextManeuverMeters.collect { dist ->
+                            _distanceToNextManeuverMeters.value = dist
+                        }
+                    }
+                    viewModelScope.launch {
+                        s.currentInstructionIndex.collect { idx ->
+                            _currentInstructionIndex.value = idx
+                        }
+                    }
+                    viewModelScope.launch {
+                        s.activeRoute.collect { r ->
+                            if (r != null && activeRoute.value == null) {
+                                activeRoute.value = r
+                            }
+                        }
+                    }
+                }
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                _trackerService.value = null
             }
         }
+
+        val intent = Intent(context, LocationTrackerService::class.java)
+        context.bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        serviceConnection = connection
     }
 
     // --- WAYPOINT MANAGEMENT ---
@@ -238,7 +333,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     fun searchPlaces(query: String) {
         viewModelScope.launch {
             _isSearching.value = true
-            val userPoint = locationTracker.locationState.value.point
+            val userPoint = _locationState.value.point
             val results = geocodingService.searchPlaces(query, userPoint.lat, userPoint.lng)
             _searchResults.value = results
             _isSearching.value = false
@@ -252,7 +347,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
 
     fun useGpsForWaypoint(index: Int) {
         locationTracker.refreshCurrentLocation()
-        val userPoint = locationTracker.locationState.value.point
+        val userPoint = _locationState.value.point
         setWaypoint(index, userPoint, "Minha Localização GPS")
         showSearchDialogForIndex.value = null
     }
@@ -267,118 +362,46 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         _currentInstruction.value = targetRoute.instructions.firstOrNull()
         showRoutePlannerSheet.value = false
 
-        audioGuidance.speak("Navegação iniciada. ${targetRoute.instructions.firstOrNull()?.text ?: ""}", true)
-        startRideTimer(targetRoute)
+        _trackerService.value?.startNavigation(targetRoute)
+            ?: audioGuidance.speak("Navegação iniciada. ${targetRoute.instructions.firstOrNull()?.text ?: ""}", true)
     }
 
     fun startSimulation(speedMultiplier: Int = 2) {
         val route = activeRoute.value ?: return
         startNavigation(route)
-        locationTracker.startSimulator(route, speedMultiplier)
+        _trackerService.value?.startSimulator(route, speedMultiplier)
     }
 
     fun stopNavigation() {
         _isNavigating.value = false
-        rideTimerJob?.cancel()
-        rideTimerJob = null
-        locationTracker.stopSimulator()
+        _trackerService.value?.stopNavigation()
         audioGuidance.speak("Navegação finalizada.")
     }
 
     fun setAssistLevel(level: AssistLevel) {
         physicsEngine.setAssistLevel(level)
+        _trackerService.value?.setAssistLevel(level)
         _telemetry.value = _telemetry.value.copy(
             activeAssist = level,
             batteryTelemetry = physicsEngine.getBatteryTelemetry()
         )
     }
 
-    private fun startRideTimer(route: RouteResult) {
-        rideTimerJob?.cancel()
-        var elapsedSec = 0
-        var speedSum = 0.0
-        var speedCount = 0
-
-        rideTimerJob = viewModelScope.launch {
-            while (_isNavigating.value) {
-                delay(1000L)
-                elapsedSec++
-                val curLoc = locationTracker.locationState.value
-                val speed = curLoc.speedKmh
-
-                speedSum += speed
-                speedCount++
-                val avgSpeed = if (speedCount > 0) speedSum / speedCount else 0.0
-
-                val progressRatio = min(1.0, elapsedSec / max(1.0, route.totalDurationSeconds.toDouble()))
-                val distRidden = (route.totalDistanceMeters * progressRatio) / 1000.0
-                val distRemaining = max(0.0, (route.totalDistanceMeters / 1000.0) - distRidden)
-                val timeRemaining = max(0, route.totalDurationSeconds - elapsedSec)
-
-                val batTelem = physicsEngine.getBatteryTelemetry()
-
-                _telemetry.value = LiveRideTelemetry(
-                    currentSpeedKmh = (speed * 10).toInt() / 10.0,
-                    avgSpeedKmh = (avgSpeed * 10).toInt() / 10.0,
-                    maxSpeedKmh = max(_telemetry.value.maxSpeedKmh, speed),
-                    distanceRiddenKm = (distRidden * 100).toInt() / 100.0,
-                    distanceRemainingKm = (distRemaining * 10).toInt() / 10.0,
-                    timeElapsedSeconds = elapsedSec,
-                    timeRemainingSeconds = timeRemaining,
-                    currentElevationM = curLoc.point.ele,
-                    elevationGainedM = max(0.0, curLoc.point.ele - (route.coordinates.firstOrNull()?.ele ?: 20.0)),
-                    currentGradePercent = 0.0,
-                    motorPowerWatts = (speed * 10).coerceAtMost(physicsEngine.getConfig().motorMaxWatt).toInt(),
-                    riderPowerWatts = (speed * 6).coerceAtLeast(40.0).toInt(),
-                    activeAssist = physicsEngine.getConfig().activeAssist,
-                    batteryTelemetry = batTelem,
-                    headingDegrees = curLoc.headingDegrees,
-                    isNavigating = true
-                )
-            }
-        }
-    }
-
-    private fun handleRiderLocationUpdate(point: GeoPoint, speedKmh: Double, heading: Float) {
-        // Immediately update telemetry live speed from GPS
-        _telemetry.value = _telemetry.value.copy(
-            currentSpeedKmh = speedKmh,
-            maxSpeedKmh = max(_telemetry.value.maxSpeedKmh, speedKmh),
-            headingDegrees = heading,
-            currentElevationM = point.ele
-        )
-
-        val route = activeRoute.value ?: return
-        if (!_isNavigating.value || route.instructions.isEmpty()) return
-
-        val activeIdx = _currentInstructionIndex.value
-        val currentManeuver = route.instructions.getOrNull(activeIdx) ?: return
-        val distToManeuver = point.distanceTo(currentManeuver.point).toInt()
-
-        _distanceToNextManeuverMeters.value = distToManeuver
-
-        if (distToManeuver <= 50) {
-            audioGuidance.speak("Em 50 metros, ${currentManeuver.text}")
-        }
-
-        if (distToManeuver <= 15) {
-            if (activeIdx < route.instructions.size - 1) {
-                val nextIdx = activeIdx + 1
-                _currentInstructionIndex.value = nextIdx
-                val nextManeuver = route.instructions[nextIdx]
-                _currentInstruction.value = nextManeuver
-                audioGuidance.speak(nextManeuver.text, true)
-            } else {
-                audioGuidance.speak("Você chegou ao seu destino! Parabéns pelo trajeto.")
-                stopNavigation()
-            }
-        }
+    fun setAudioMuted(muted: Boolean) {
+        audioGuidance.isMuted = muted
+        _trackerService.value?.setAudioMuted(muted)
     }
 
     override fun onCleared() {
         super.onCleared()
-        locationTracker.stopTracking()
-        locationTracker.stopSimulator()
+        serviceConnection?.let { conn ->
+            try {
+                getApplication<Application>().unbindService(conn)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            serviceConnection = null
+        }
         audioGuidance.shutdown()
     }
 }
