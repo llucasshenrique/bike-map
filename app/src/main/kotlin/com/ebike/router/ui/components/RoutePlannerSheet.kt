@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.sp
 import com.ebike.router.model.RouteResult
 import com.ebike.router.model.RouteWaypoint
 import com.ebike.router.model.RoutingProfile
+import com.ebike.router.service.OfflineDownloadState
 import com.ebike.router.ui.theme.*
 
 @Composable
@@ -45,6 +46,9 @@ fun RoutePlannerSheet(
     onStartNavigation: (RouteResult) -> Unit,
     onStartSimulation: (RouteResult) -> Unit,
     onClose: () -> Unit,
+    estimatedOfflineTiles: Int = 0,
+    downloadProgress: OfflineDownloadState = OfflineDownloadState.Idle,
+    onDownloadOfflineMap: (RouteResult) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -382,6 +386,79 @@ fun RoutePlannerSheet(
                         Text("SIMULADOR", fontWeight = FontWeight.Bold)
                     }
                 }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // OFFLINE MAP PRE-DOWNLOAD
+                OfflineMapDownloadRow(
+                    estimatedTiles = estimatedOfflineTiles,
+                    downloadProgress = downloadProgress,
+                    onDownload = { onDownloadOfflineMap(route) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun OfflineMapDownloadRow(
+    estimatedTiles: Int,
+    downloadProgress: OfflineDownloadState,
+    onDownload: () -> Unit
+) {
+    val estimatedMb = (estimatedTiles * 15_000L) / (1024.0 * 1024.0)
+
+    Card(
+        shape = RoundedCornerShape(10.dp),
+        colors = CardDefaults.cardColors(containerColor = Slate800)
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("MAPA OFFLINE", fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, color = Slate400)
+                    val statusText = when (downloadProgress) {
+                        is OfflineDownloadState.Done -> "✓ Mapa offline disponível para esta rota"
+                        is OfflineDownloadState.Error -> downloadProgress.message
+                        is OfflineDownloadState.Running -> "Baixando... ${downloadProgress.downloaded}/${downloadProgress.total} blocos"
+                        OfflineDownloadState.Idle -> "~$estimatedTiles blocos · ~${(estimatedMb * 10).toInt() / 10.0} MB"
+                    }
+                    Text(
+                        text = statusText,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = if (downloadProgress is OfflineDownloadState.Done) EmeraldGreen else Color.White
+                    )
+                }
+
+                val isRunning = downloadProgress is OfflineDownloadState.Running
+                Button(
+                    onClick = onDownload,
+                    enabled = !isRunning && estimatedTiles > 0,
+                    colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary.copy(alpha = 0.2f), contentColor = CyanGlow),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    if (isRunning) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = CyanGlow, strokeWidth = 2.dp)
+                    } else {
+                        Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Baixar", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            if (downloadProgress is OfflineDownloadState.Running && downloadProgress.total > 0) {
+                Spacer(modifier = Modifier.height(6.dp))
+                LinearProgressIndicator(
+                    progress = { downloadProgress.downloaded.toFloat() / downloadProgress.total.toFloat() },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = CyanGlow,
+                    trackColor = Slate700
+                )
             }
         }
     }

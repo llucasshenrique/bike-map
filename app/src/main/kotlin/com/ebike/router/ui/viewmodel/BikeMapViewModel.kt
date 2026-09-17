@@ -9,6 +9,8 @@ import com.ebike.router.service.AudioGuidanceService
 import com.ebike.router.service.GeocodingService
 import com.ebike.router.service.GraphRouterService
 import com.ebike.router.service.LocationTrackerService
+import com.ebike.router.service.OfflineDownloadState
+import com.ebike.router.service.OfflineTileCacheService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,6 +26,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     val geocodingService = GeocodingService()
     val audioGuidance = AudioGuidanceService(application)
     val locationTracker = LocationTrackerService(application)
+    val offlineTileCacheService = OfflineTileCacheService()
 
     // Waypoints
     private val _waypoints = MutableStateFlow<List<RouteWaypoint>>(
@@ -82,6 +85,44 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     fun recenterMap() {
         locationTracker.refreshCurrentLocation()
         recenterEvent.value = System.currentTimeMillis()
+    }
+
+    // --- OFFLINE MAP TILE CACHE ---
+
+    private val _downloadProgress = MutableStateFlow<OfflineDownloadState>(OfflineDownloadState.Idle)
+    val downloadProgress: StateFlow<OfflineDownloadState> = _downloadProgress.asStateFlow()
+
+    // Route pending a region pre-download; consumed by OsmdroidMapView, which owns
+    // the live MapView that CacheManager needs to validate the tile source policy.
+    private val _offlineDownloadRequest = MutableStateFlow<RouteResult?>(null)
+    val offlineDownloadRequest: StateFlow<RouteResult?> = _offlineDownloadRequest.asStateFlow()
+
+    fun estimateOfflineTileCount(route: RouteResult): Int {
+        val bbox = offlineTileCacheService.boundingBoxForRoute(route.coordinates) ?: return 0
+        return offlineTileCacheService.estimateTileCount(bbox)
+    }
+
+    fun downloadOfflineMap(route: RouteResult) {
+        if (_downloadProgress.value is OfflineDownloadState.Running) return
+        _downloadProgress.value = OfflineDownloadState.Running(0, estimateOfflineTileCount(route))
+        _offlineDownloadRequest.value = route
+    }
+
+    fun onOfflineDownloadProgress(downloaded: Int, total: Int) {
+        _downloadProgress.value = OfflineDownloadState.Running(downloaded, total)
+    }
+
+    fun onOfflineDownloadFinished(success: Boolean) {
+        _downloadProgress.value = if (success) {
+            OfflineDownloadState.Done
+        } else {
+            OfflineDownloadState.Error("Falha ao baixar mapa offline")
+        }
+        _offlineDownloadRequest.value = null
+    }
+
+    fun resetOfflineDownloadState() {
+        _downloadProgress.value = OfflineDownloadState.Idle
     }
 
     // UI Sheets / Dialogs

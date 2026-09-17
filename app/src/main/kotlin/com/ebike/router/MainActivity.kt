@@ -87,6 +87,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
     val activeRoute by viewModel.activeRoute.collectAsState()
     val telemetry by viewModel.telemetry.collectAsState()
     val waypoints by viewModel.waypoints.collectAsState()
+    val downloadProgress by viewModel.downloadProgress.collectAsState()
 
     var showMapClickMenuForPoint by remember { mutableStateOf<com.ebike.router.model.GeoPoint?>(null) }
 
@@ -368,7 +369,10 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                     onSelectRoute = { viewModel.selectRoute(it) },
                     onStartNavigation = { viewModel.startNavigation(it) },
                     onStartSimulation = { viewModel.startSimulation(2) },
-                    onClose = { viewModel.showRoutePlannerSheet.value = false }
+                    onClose = { viewModel.showRoutePlannerSheet.value = false },
+                    estimatedOfflineTiles = activeRoute?.let { viewModel.estimateOfflineTileCount(it) } ?: 0,
+                    downloadProgress = downloadProgress,
+                    onDownloadOfflineMap = { viewModel.downloadOfflineMap(it) }
                 )
             }
         }
