@@ -9,11 +9,16 @@ import com.ebike.router.service.AudioGuidanceService
 import com.ebike.router.service.GeocodingService
 import com.ebike.router.service.GraphRouterService
 import com.ebike.router.service.LocationTrackerService
+import com.ebike.router.data.BikePreferencesRepository
+import com.ebike.router.data.UserBikePreferences
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlin.math.max
 import kotlin.math.min
@@ -24,6 +29,21 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     val geocodingService = GeocodingService()
     val audioGuidance = AudioGuidanceService(application)
     val locationTracker = LocationTrackerService(application)
+    val bikePreferencesRepo = BikePreferencesRepository(application)
+
+    val bikePreferences: StateFlow<UserBikePreferences> = bikePreferencesRepo.bikePreferencesFlow.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.Eagerly,
+        initialValue = UserBikePreferences()
+    )
+
+    val isEBikeMode: StateFlow<Boolean> = bikePreferencesRepo.bikePreferencesFlow
+        .map { it.isEBikeMode }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = false
+        )
 
     // Waypoints
     private val _waypoints = MutableStateFlow<List<RouteWaypoint>>(
@@ -65,8 +85,14 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     private val _distanceToNextManeuverMeters = MutableStateFlow(0)
     val distanceToNextManeuverMeters: StateFlow<Int> = _distanceToNextManeuverMeters.asStateFlow()
 
-    // Live Telemetry
-    private val _telemetry = MutableStateFlow(LiveRideTelemetry())
+    // Live Telemetry (starts in normal bike mode by default)
+    private val _telemetry = MutableStateFlow(
+        LiveRideTelemetry(
+            isEBikeMode = false,
+            batteryTelemetry = null,
+            activeAssist = AssistLevel.OFF
+        )
+    )
     val telemetry: StateFlow<LiveRideTelemetry> = _telemetry.asStateFlow()
 
     // Search
@@ -88,6 +114,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     val showRoutePlannerSheet = MutableStateFlow(false) // Start with full map view & compact bottom bar
     val showSearchDialogForIndex = MutableStateFlow<Int?>(null)
     val showCockpitDialog = MutableStateFlow(false)
+    val showSettingsDialog = MutableStateFlow(false)
     val showRangeCircle = MutableStateFlow(true)
 
     private var rideTimerJob: Job? = null
@@ -95,6 +122,18 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         locationTracker.startTracking()
+
+        // Sync physics engine and telemetry with persisted preferences
+        viewModelScope.launch {
+            bikePreferencesRepo.bikePreferencesFlow.collect { prefs ->
+                physicsEngine.syncWithPreferences(prefs)
+                _telemetry.value = _telemetry.value.copy(
+                    isEBikeMode = prefs.isEBikeMode,
+                    batteryTelemetry = if (prefs.isEBikeMode) physicsEngine.getBatteryTelemetry() else null,
+                    activeAssist = if (prefs.isEBikeMode) physicsEngine.getConfig().activeAssist else AssistLevel.OFF
+                )
+            }
+        }
 
         // Follow user location changes
         viewModelScope.launch {
@@ -212,7 +251,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _isCalculating.value = true
             try {
-                val routes = routerService.calculateMultipleRoutes(validPoints, _selectedProfile.value)
+                val routes = routerService.calculateMultipleRoutes(validPoints, _selectedProfile.value, isEBikeMode.value)
                 _availableRoutes.value = routes
                 if (routes.isNotEmpty()) {
                     selectRoute(0)
@@ -230,6 +269,50 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
             val route = routes[index]
             activeRoute.value = route
             _currentInstruction.value = route.instructions.firstOrNull()
+        }
+    }
+
+    // --- PREFERENCES & CONFIGURATION ---
+
+    fun updateEBikeMode(enabled: Boolean) {
+        viewModelScope.launch {
+            bikePreferencesRepo.updateEBikeMode(enabled)
+            if (hasEnoughValidPoints()) {
+                calculateRoute()
+            }
+        }
+    }
+
+    fun updateBikeSpecs(
+        batteryCapacityWh: Double,
+        maxAssistSpeedKmh: Double,
+        bikeWeightKg: Double,
+        riderWeightKg: Double,
+        regenerativeBraking: Boolean = false
+    ) {
+        viewModelScope.launch {
+            bikePreferencesRepo.updateBikeSpecs(
+                batteryCapacityWh = batteryCapacityWh,
+                maxAssistSpeedKmh = maxAssistSpeedKmh,
+                bikeWeightKg = bikeWeightKg,
+                riderWeightKg = riderWeightKg,
+                regenerativeBraking = regenerativeBraking
+            )
+            if (hasEnoughValidPoints()) {
+                calculateRoute()
+            }
+        }
+    }
+
+    fun updateCurrentBatteryWh(currentWh: Double) {
+        viewModelScope.launch {
+            bikePreferencesRepo.updateCurrentBatteryWh(currentWh)
+            physicsEngine.updateBatteryWh(currentWh)
+            if (isEBikeMode.value) {
+                _telemetry.value = _telemetry.value.copy(
+                    batteryTelemetry = physicsEngine.getBatteryTelemetry()
+                )
+            }
         }
     }
 
@@ -286,6 +369,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setAssistLevel(level: AssistLevel) {
+        if (!isEBikeMode.value) return
         physicsEngine.setAssistLevel(level)
         _telemetry.value = _telemetry.value.copy(
             activeAssist = level,
@@ -305,6 +389,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
                 elapsedSec++
                 val curLoc = locationTracker.locationState.value
                 val speed = curLoc.speedKmh
+                val eBikeMode = isEBikeMode.value
 
                 speedSum += speed
                 speedCount++
@@ -315,7 +400,42 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
                 val distRemaining = max(0.0, (route.totalDistanceMeters / 1000.0) - distRidden)
                 val timeRemaining = max(0, route.totalDurationSeconds - elapsedSec)
 
-                val batTelem = physicsEngine.getBatteryTelemetry()
+                val batTelem = if (eBikeMode) physicsEngine.getBatteryTelemetry() else null
+
+                val motorWatts: Int
+                val riderWatts: Int
+                if (speed < 0.5) {
+                    motorWatts = 0
+                    riderWatts = 0
+                } else if (!eBikeMode) {
+                    motorWatts = 0
+                    val speedMs = speed / 3.6
+                    val config = physicsEngine.getConfig()
+                    val totalMass = config.bikeWeightKg + config.riderWeightKg
+                    val fRolling = config.tireRollingCoeff * totalMass * 9.81
+                    val fAero = 0.5 * 1.225 * config.aerodynamicCdA * speedMs * speedMs
+                    val pMech = (fRolling + fAero) * speedMs
+                    riderWatts = min(450.0, max(40.0, pMech)).toInt()
+                } else {
+                    val speedMs = speed / 3.6
+                    val config = physicsEngine.getConfig()
+                    val totalMass = config.bikeWeightKg + config.riderWeightKg
+                    val fRolling = config.tireRollingCoeff * totalMass * 9.81
+                    val fAero = 0.5 * 1.225 * config.aerodynamicCdA * speedMs * speedMs
+                    val pMech = (fRolling + fAero) * speedMs
+
+                    val assist = config.activeAssist
+                    if (assist == AssistLevel.OFF || speed > config.maxAssistSpeedKmh) {
+                        motorWatts = 0
+                        riderWatts = min(450.0, max(40.0, pMech)).toInt()
+                    } else {
+                        val totalRatio = 1.0 + assist.motorAssistRatio
+                        val motorDemand = (pMech * (assist.motorAssistRatio / totalRatio)) / config.motorEfficiency
+                        val effMotor = min(config.motorMaxWatt, motorDemand)
+                        motorWatts = effMotor.toInt()
+                        riderWatts = max(30.0, pMech - (effMotor * config.motorEfficiency)).toInt()
+                    }
+                }
 
                 _telemetry.value = LiveRideTelemetry(
                     currentSpeedKmh = (speed * 10).toInt() / 10.0,
@@ -328,10 +448,12 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
                     currentElevationM = curLoc.point.ele,
                     elevationGainedM = max(0.0, curLoc.point.ele - (route.coordinates.firstOrNull()?.ele ?: 20.0)),
                     currentGradePercent = 0.0,
-                    motorPowerWatts = (speed * 10).coerceAtMost(physicsEngine.getConfig().motorMaxWatt).toInt(),
-                    riderPowerWatts = (speed * 6).coerceAtLeast(40.0).toInt(),
-                    activeAssist = physicsEngine.getConfig().activeAssist,
+                    motorPowerWatts = motorWatts,
+                    riderPowerWatts = riderWatts,
+                    activeAssist = if (eBikeMode) physicsEngine.getConfig().activeAssist else AssistLevel.OFF,
                     batteryTelemetry = batTelem,
+                    isEBikeMode = eBikeMode,
+                    isPowerEstimated = true,
                     headingDegrees = curLoc.headingDegrees,
                     isNavigating = true
                 )

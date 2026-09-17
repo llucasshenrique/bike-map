@@ -23,13 +23,14 @@ class GraphRouterService(
 
     suspend fun calculateMultipleRoutes(
         points: List<GeoPoint>,
-        profile: RoutingProfile = RoutingProfile.EFFICIENT
+        profile: RoutingProfile = RoutingProfile.EFFICIENT,
+        isEBikeMode: Boolean = false
     ): List<RouteResult> = withContext(Dispatchers.IO) {
         if (points.size < 2) return@withContext emptyList()
 
         // 1. Try Global OpenStreetMap Bike Engine
         try {
-            val osmRoutes = fetchOSMBikeRoutes(points, profile)
+            val osmRoutes = fetchOSMBikeRoutes(points, profile, isEBikeMode)
             if (osmRoutes.isNotEmpty()) {
                 return@withContext osmRoutes
             }
@@ -38,13 +39,14 @@ class GraphRouterService(
         }
 
         // 2. Offline direct connector fallback
-        val directRoute = buildDirectRoute(points, profile)
+        val directRoute = buildDirectRoute(points, profile, isEBikeMode)
         return@withContext listOf(directRoute)
     }
 
     private fun fetchOSMBikeRoutes(
         points: List<GeoPoint>,
-        profile: RoutingProfile
+        profile: RoutingProfile,
+        isEBikeMode: Boolean
     ): List<RouteResult> {
         val coordsParam = points.joinToString(";") { "${it.lng},${it.lat}" }
         val urls = listOf(
@@ -78,7 +80,7 @@ class GraphRouterService(
         val results = mutableListOf<RouteResult>()
         for (i in 0 until routesArray.size()) {
             val routeObj = routesArray.get(i).asJsonObject
-            val parsed = parseSingleRoute(routeObj, points.first(), points.last(), profile, i)
+            val parsed = parseSingleRoute(routeObj, points.first(), points.last(), profile, i, isEBikeMode)
             results.add(parsed)
         }
         return results
@@ -89,7 +91,8 @@ class GraphRouterService(
         startPoint: GeoPoint,
         endPoint: GeoPoint,
         profile: RoutingProfile,
-        routeIndex: Int
+        routeIndex: Int,
+        isEBikeMode: Boolean
     ): RouteResult {
         val geometry = routeObj.getAsJsonObject("geometry")
         val coordinatesArray = geometry.getAsJsonArray("coordinates")
@@ -155,14 +158,29 @@ class GraphRouterService(
                     maxGrade = max(maxGrade, abs(stepGrade))
                     totalGradeSum += abs(stepGrade)
 
-                    val cruisingSpeed = if (profile == RoutingProfile.TURBO) 30.0 else if (profile == RoutingProfile.SAFE) 22.0 else 26.0
-                    val energyResult = physicsEngine.calculateSegmentEnergy(stepDist, stepGrade, cruisingSpeed)
+                    val cruisingSpeed = if (!isEBikeMode) {
+                        when (profile) {
+                            RoutingProfile.TURBO -> 24.0
+                            RoutingProfile.SAFE -> 18.0
+                            RoutingProfile.SCENIC -> 19.0
+                            RoutingProfile.EFFICIENT -> 22.0
+                        }
+                    } else {
+                        when (profile) {
+                            RoutingProfile.TURBO -> min(30.0, physicsEngine.getConfig().maxAssistSpeedKmh)
+                            RoutingProfile.SAFE -> 22.0
+                            RoutingProfile.SCENIC -> 23.0
+                            RoutingProfile.EFFICIENT -> min(26.0, physicsEngine.getConfig().maxAssistSpeedKmh)
+                        }
+                    }
+                    val assistLevel = if (isEBikeMode) physicsEngine.getConfig().activeAssist else AssistLevel.OFF
+                    val energyResult = physicsEngine.calculateSegmentEnergy(stepDist, stepGrade, cruisingSpeed, assistLevel)
                     totalDurationSec += energyResult.durationSeconds
                     totalEnergyWh += energyResult.energyWh
 
                     val maneuverObj = step.getAsJsonObject("maneuver")
                     val maneuverType = mapManeuver(maneuverObj?.get("type")?.asString, maneuverObj?.get("modifier")?.asString, stepIdx, steps.size(), stepGrade)
-                    val maneuverText = formatManeuverText(maneuverType, stepName, stepDist.toInt())
+                    val maneuverText = formatManeuverText(maneuverType, stepName, stepDist.toInt(), isEBikeMode)
 
                     val anchorPoint = stepCoords.firstOrNull() ?: allCoords.getOrElse(min(stepIdx, allCoords.size - 1)) { startPoint }
 
@@ -207,12 +225,12 @@ class GraphRouterService(
         }
 
         val finalDistM = max(routeObj.get("distance")?.asDouble ?: totalDistM, 20.0).roundToInt()
-        val finalEnergy = max(0.5, (totalEnergyWh * 10).roundToInt() / 10.0)
+        val finalEnergy = if (isEBikeMode) max(0.5, (totalEnergyWh * 10).roundToInt() / 10.0) else 0.0
         val batCap = physicsEngine.getConfig().batteryCapacityWh
         val curBat = physicsEngine.getConfig().currentBatteryWh
-        val drainPct = ((finalEnergy / batCap) * 1000).roundToInt() / 10.0
-        val remWh = max(0.0, curBat - finalEnergy).roundToInt()
-        val remPct = max(0, ((remWh / batCap) * 100).roundToInt())
+        val drainPct = if (isEBikeMode && batCap > 0) ((finalEnergy / batCap) * 1000).roundToInt() / 10.0 else 0.0
+        val remWh = if (isEBikeMode) max(0.0, curBat - finalEnergy).roundToInt() else 0
+        val remPct = if (isEBikeMode && batCap > 0) max(0, ((remWh / batCap) * 100).roundToInt()) else 0
         val avgGrade = if (stepIdx > 0) ((totalGradeSum / stepIdx) * 10).roundToInt() / 10.0 else 0.0
 
         val firstLegSummary = legsArray?.firstOrNull()?.asJsonObject?.get("summary")?.asString?.ifBlank { null }
@@ -223,11 +241,19 @@ class GraphRouterService(
             "Caminho Mais Plano (Eco)$viaText",
             "Ciclovia Cênica$viaText"
         )
-        val routeSummaries = listOf(
-            "Melhor equilíbrio entre velocidade e autonomia",
-            "Menos subidas, elevação suave e economia de bateria",
-            "Prioridade para ciclovias e vias tranquilas"
-        )
+        val routeSummaries = if (isEBikeMode) {
+            listOf(
+                "Melhor equilíbrio entre velocidade e autonomia",
+                "Menos subidas, elevação suave e economia de bateria",
+                "Prioridade para ciclovias e vias tranquilas"
+            )
+        } else {
+            listOf(
+                "Melhor equilíbrio entre velocidade e distância",
+                "Menos subidas e elevação suave para pedalar",
+                "Prioridade para ciclovias e vias tranquilas"
+            )
+        }
 
         return RouteResult(
             id = "route_${System.currentTimeMillis()}_$routeIndex",
@@ -251,11 +277,12 @@ class GraphRouterService(
         )
     }
 
-    private fun buildDirectRoute(points: List<GeoPoint>, profile: RoutingProfile): RouteResult {
+    private fun buildDirectRoute(points: List<GeoPoint>, profile: RoutingProfile, isEBikeMode: Boolean = false): RouteResult {
         val totalDistM = points.zipWithNext { a, b -> a.distanceTo(b) }.sum().roundToInt()
-        val cruisingSpeed = 25.0
-        val durationSec = ((totalDistM / (cruisingSpeed / 3.6))).roundToInt()
-        val energyResult = physicsEngine.calculateSegmentEnergy(totalDistM.toDouble(), 0.0, cruisingSpeed)
+        val cruisingSpeed = if (isEBikeMode) min(25.0, physicsEngine.getConfig().maxAssistSpeedKmh) else 20.0
+        val assist = if (isEBikeMode) physicsEngine.getConfig().activeAssist else AssistLevel.OFF
+        val energyResult = physicsEngine.calculateSegmentEnergy(totalDistM.toDouble(), 0.0, cruisingSpeed, assist)
+        val durationSec = energyResult.durationSeconds
 
         val instructions = mutableListOf<TurnInstruction>()
         instructions.add(
@@ -287,6 +314,7 @@ class GraphRouterService(
             )
         )
 
+        val segName = if (isEBikeMode) "Trajeto E-Bike" else "Trajeto de Bicicleta"
         return RouteResult(
             id = "direct_${System.currentTimeMillis()}",
             name = "Rota Direta Estimada",
@@ -294,7 +322,7 @@ class GraphRouterService(
             profile = profile,
             totalDistanceMeters = totalDistM,
             totalDurationSeconds = durationSec,
-            totalEnergyWh = energyResult.energyWh,
+            totalEnergyWh = if (isEBikeMode) energyResult.energyWh else 0.0,
             elevationGainM = 15,
             elevationLossM = 10,
             maxGradePercent = 2.0,
@@ -309,19 +337,19 @@ class GraphRouterService(
                 RouteSegment(
                     fromNodeId = "p0",
                     toNodeId = "p1",
-                    name = "Trajeto E-Bike",
+                    name = segName,
                     distanceMeters = totalDistM,
                     gradePercent = 0.0,
                     elevationGainM = 15,
                     elevationLossM = 10,
                     coordinates = points,
-                    estimatedEnergyWh = energyResult.energyWh,
+                    estimatedEnergyWh = if (isEBikeMode) energyResult.energyWh else 0.0,
                     estimatedTimeSeconds = durationSec
                 )
             ),
-            batteryDrainPercent = 2.5,
-            estimatedBatteryRemainingWh = 540,
-            batteryRemainingPercent = 88
+            batteryDrainPercent = if (isEBikeMode) 2.5 else 0.0,
+            estimatedBatteryRemainingWh = if (isEBikeMode) 540 else 0,
+            batteryRemainingPercent = if (isEBikeMode) 88 else 0
         )
     }
 
@@ -342,7 +370,7 @@ class GraphRouterService(
         }
     }
 
-    private fun formatManeuverText(maneuver: ManeuverType, streetName: String, distMeters: Int): String {
+    private fun formatManeuverText(maneuver: ManeuverType, streetName: String, distMeters: Int, isEBikeMode: Boolean = false): String {
         val distStr = if (distMeters >= 1000) "${(distMeters / 1000.0 * 10).roundToInt() / 10.0} km" else "$distMeters metros"
         return when (maneuver) {
             ManeuverType.DEPART -> "Siga em frente por $distStr na $streetName"
@@ -354,7 +382,7 @@ class GraphRouterService(
             ManeuverType.SLIGHT_LEFT -> "Mantenha-se à esquerda na $streetName ($distStr)"
             ManeuverType.SHARP_LEFT -> "Curva fechada à esquerda na $streetName ($distStr)"
             ManeuverType.ROUNDABOUT -> "Entre na rotatória em direção à $streetName"
-            ManeuverType.CLIMB_AHEAD -> "Subida íngreme à frente! Aumente o nível de assistência"
+            ManeuverType.CLIMB_AHEAD -> if (isEBikeMode) "Subida íngreme à frente! Ajuste o nível de assistência se necessário" else "Subida íngreme à frente! Reduza as marchas"
             ManeuverType.U_TURN -> "Faça o retorno quando possível"
             ManeuverType.ARRIVE -> "Você chegou ao seu destino!"
         }

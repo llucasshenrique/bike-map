@@ -13,9 +13,15 @@ enum class AssistLevel(
     TURBO(3.0, 32.0, "Turbo (300% - 32 km/h)", 0xFFEF4444)
 }
 
+enum class TelemetryOrigin {
+    SIMULATED_ESTIMATE,
+    GPS_MEASURED
+}
+
 data class EBikeConfig(
     val batteryCapacityWh: Double = 625.0,
     val currentBatteryWh: Double = 560.0,
+    val maxAssistSpeedKmh: Double = 32.0,
     val bikeWeightKg: Double = 24.0,
     val riderWeightKg: Double = 75.0,
     val motorMaxWatt: Double = 350.0, // CONTRAN 996/2023 (Brasil)
@@ -33,7 +39,8 @@ data class BatteryTelemetry(
     val estimatedRangeKm: Double,
     val instantPowerWatt: Double = 0.0,
     val instantConsumptionWhPerKm: Double = 0.0,
-    val voltageApprox: Double = 36.0
+    val voltageApprox: Double = 36.0,
+    val origin: TelemetryOrigin = TelemetryOrigin.SIMULATED_ESTIMATE
 )
 
 data class LiveRideTelemetry(
@@ -50,7 +57,9 @@ data class LiveRideTelemetry(
     val motorPowerWatts: Int = 0,
     val riderPowerWatts: Int = 0,
     val activeAssist: AssistLevel = AssistLevel.TOUR,
-    val batteryTelemetry: BatteryTelemetry = BatteryTelemetry(560.0, 625.0, 90, 56.0),
+    val batteryTelemetry: BatteryTelemetry? = null,
+    val isEBikeMode: Boolean = false,
+    val isPowerEstimated: Boolean = true,
     val headingDegrees: Float = 0f,
     val isNavigating: Boolean = false,
     val isPaused: Boolean = false

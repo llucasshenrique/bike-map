@@ -28,7 +28,8 @@ fun NavigationHud(
     onToggleMute: () -> Unit,
     onStopNavigation: () -> Unit,
     onOpenCockpit: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isEBikeMode: Boolean = telemetry.isEBikeMode
 ) {
     Box(modifier = modifier.fillMaxSize().padding(16.dp)) {
         // TOP: Turn Instruction Card
@@ -115,7 +116,7 @@ fun NavigationHud(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Speedometer
+                    // Left: Speedometer
                     Column {
                         Row(verticalAlignment = Alignment.Bottom) {
                             val speedText = if (telemetry.currentSpeedKmh > 0.0 && telemetry.currentSpeedKmh < 10.0) {
@@ -137,10 +138,17 @@ fun NavigationHud(
                                 modifier = Modifier.padding(bottom = 6.dp)
                             )
                         }
-                        Text(text = "Assistência: ${telemetry.activeAssist.name}", fontSize = 11.sp, color = CyanGlow, fontWeight = FontWeight.Bold)
+                        if (isEBikeMode) {
+                            Text(
+                                text = "Assist: ${telemetry.activeAssist.name} (Simulado)",
+                                fontSize = 11.sp,
+                                color = CyanGlow,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
 
-                    // Battery & Distance
+                    // Center: Distance & Duration
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text(
                             text = "${telemetry.distanceRemainingKm} km",
@@ -149,24 +157,43 @@ fun NavigationHud(
                             color = Color.White
                         )
                         val remMin = telemetry.timeRemainingSeconds / 60
-                        Text(text = "Restante: $remMin min", fontSize = 11.sp, color = Slate400)
+                        val etaLabel = if (isEBikeMode) "Restante: $remMin min (motor)" else "Restante: $remMin min"
+                        Text(text = etaLabel, fontSize = 11.sp, color = Slate400)
                     }
 
-                    // Battery status
-                    Column(horizontalAlignment = Alignment.End) {
-                        val batPct = telemetry.batteryTelemetry.percentage
+                    // Right: Battery Status (E-Bike) OR Trip Elevation Gain (Normal Bike)
+                    if (isEBikeMode && telemetry.batteryTelemetry != null) {
+                        val bat = telemetry.batteryTelemetry!!
+                        val batPct = bat.percentage
                         val batColor = if (batPct > 40) EmeraldGreen else if (batPct > 15) AmberWarning else RedSteep
-                        Text(
-                            text = "$batPct%",
-                            fontSize = 20.sp,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = batColor
-                        )
-                        Text(
-                            text = "${telemetry.batteryTelemetry.estimatedRangeKm} km est.",
-                            fontSize = 11.sp,
-                            color = Slate400
-                        )
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(
+                                text = "$batPct% est.",
+                                fontSize = 19.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = batColor
+                            )
+                            Text(
+                                text = "${bat.estimatedRangeKm} km est.",
+                                fontSize = 11.sp,
+                                color = Slate400
+                            )
+                        }
+                    } else {
+                        // Normal Bike Mode: Clean Elevation / Average Speed display
+                        Column(horizontalAlignment = Alignment.End) {
+                            Text(
+                                text = "▲ ${telemetry.elevationGainedM.toInt()}m",
+                                fontSize = 19.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                color = AmberWarning
+                            )
+                            Text(
+                                text = "Ø ${telemetry.avgSpeedKmh} km/h",
+                                fontSize = 11.sp,
+                                color = Slate400
+                            )
+                        }
                     }
                 }
 
@@ -181,7 +208,12 @@ fun NavigationHud(
                         modifier = Modifier.weight(1f),
                         colors = ButtonDefaults.buttonColors(containerColor = Slate800)
                     ) {
-                        Icon(Icons.Default.DirectionsBike, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Icon(
+                            if (isEBikeMode) Icons.Default.ElectricBike else Icons.Default.DirectionsBike,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = if (isEBikeMode) CyanGlow else EmeraldGreen
+                        )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Cockpit")
                     }

@@ -45,7 +45,8 @@ fun RoutePlannerSheet(
     onStartNavigation: (RouteResult) -> Unit,
     onStartSimulation: (RouteResult) -> Unit,
     onClose: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    isEBikeMode: Boolean = false
 ) {
     Card(
         modifier = modifier
@@ -68,18 +69,23 @@ fun RoutePlannerSheet(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Box(modifier = Modifier.size(8.dp).background(EmeraldGreen, CircleShape))
-                    Text("Planejador E-Bike", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Box(modifier = Modifier.size(8.dp).background(if (isEBikeMode) CyanGlow else EmeraldGreen, CircleShape))
+                    Text(
+                        text = if (isEBikeMode) "Planejador E-Bike" else "Planejador de Rotas",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
                     Surface(
-                        color = EmeraldGreen.copy(alpha = 0.2f),
+                        color = (if (isEBikeMode) CyanPrimary else EmeraldGreen).copy(alpha = 0.2f),
                         shape = RoundedCornerShape(4.dp)
                     ) {
                         Text(
-                            "MULTI-PARADAS",
+                            text = if (isEBikeMode) "SIMULAÇÃO E-BIKE" else "MULTI-PARADAS",
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                             fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
-                            color = EmeraldGreen
+                            color = if (isEBikeMode) CyanGlow else EmeraldGreen
                         )
                     }
                 }
@@ -261,9 +267,9 @@ fun RoutePlannerSheet(
                     Spacer(modifier = Modifier.width(8.dp))
                     Text("CALCULANDO ROTA REAL...", fontWeight = FontWeight.Black)
                 } else {
-                    Icon(Icons.Default.ElectricBike, contentDescription = null)
+                    Icon(if (isEBikeMode) Icons.Default.ElectricBike else Icons.Default.DirectionsBike, contentDescription = null)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("CALCULAR ROTA E-BIKE", fontWeight = FontWeight.Black, fontSize = 14.sp)
+                    Text(if (isEBikeMode) "CALCULAR ROTA E-BIKE" else "CALCULAR ROTA", fontWeight = FontWeight.Black, fontSize = 14.sp)
                 }
             }
 
@@ -311,7 +317,9 @@ fun RoutePlannerSheet(
                                 ) {
                                     Text("📏 ${(opt.totalDistanceMeters / 1000.0 * 10).toInt() / 10.0} km", fontSize = 11.sp, color = Slate400)
                                     Text("⏱️ ${opt.totalDurationSeconds / 60} min", fontSize = 11.sp, color = CyanGlow)
-                                    Text("⚡ -${opt.totalEnergyWh} Wh", fontSize = 11.sp, color = EmeraldGreen)
+                                    if (isEBikeMode) {
+                                        Text("⚡ -${opt.totalEnergyWh} Wh", fontSize = 11.sp, color = EmeraldGreen)
+                                    }
                                     Text("▲ ${opt.elevationGainM}m", fontSize = 11.sp, color = AmberWarning)
                                 }
                             }
@@ -335,13 +343,18 @@ fun RoutePlannerSheet(
                     Card(modifier = Modifier.weight(1f), shape = RoundedCornerShape(10.dp), colors = CardDefaults.cardColors(containerColor = Slate800)) {
                         Column(modifier = Modifier.padding(10.dp)) {
                             Text("${route.totalDurationSeconds / 60} min", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = CyanGlow)
-                            Text("TEMPO EST.", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Slate400)
+                            Text(if (isEBikeMode) "TEMPO (MOTOR)" else "TEMPO EST.", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Slate400)
                         }
                     }
                     Card(modifier = Modifier.weight(1f), shape = RoundedCornerShape(10.dp), colors = CardDefaults.cardColors(containerColor = Slate800)) {
                         Column(modifier = Modifier.padding(10.dp)) {
-                            Text("-${route.totalEnergyWh} Wh", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = EmeraldGreen)
-                            Text("BATERIA (${route.batteryDrainPercent}%)", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Slate400)
+                            if (isEBikeMode) {
+                                Text("-${route.totalEnergyWh} Wh", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = EmeraldGreen)
+                                Text("BATERIA (${route.batteryDrainPercent}%)", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Slate400)
+                            } else {
+                                Text("▲ ${route.elevationGainM} m", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = AmberWarning)
+                                Text("GANHO ELEV.", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Slate400)
+                            }
                         }
                     }
                 }

@@ -46,4 +46,57 @@ class EBikePhysicsEngineTest {
         assertTrue("Downhill steep segment should produce negative or zero energy (regen)", result.energyWh <= 0.0)
         assertEquals(0, result.motorWatt)
     }
+
+    @Test
+    fun testAssistOffZeroEnergyAndClimbDeceleration() {
+        // Flat segment with assist OFF
+        val flatResult = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = 0.0,
+            targetSpeedKmh = 22.0,
+            assistLevel = AssistLevel.OFF
+        )
+        assertEquals(0.0, flatResult.energyWh, 0.001)
+        assertEquals(0, flatResult.motorWatt)
+        assertTrue("Rider should provide positive watts", flatResult.riderWatt > 0)
+
+        // Steep climb with assist OFF
+        val climbResult = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = 8.0,
+            targetSpeedKmh = 22.0,
+            assistLevel = AssistLevel.OFF
+        )
+        assertEquals(0.0, climbResult.energyWh, 0.001)
+        assertEquals(0, climbResult.motorWatt)
+        assertTrue(
+            "Climb duration without assist should be longer than flat due to human power limit",
+            climbResult.durationSeconds > flatResult.durationSeconds
+        )
+    }
+
+    @Test
+    fun testSyncWithPreferencesScalesRange() {
+        val initialTelem = physicsEngine.getBatteryTelemetry()
+
+        val customPrefs = com.ebike.router.data.UserBikePreferences(
+            isEBikeMode = true,
+            batteryCapacityWh = 750.0,
+            currentBatteryWh = 750.0,
+            maxAssistSpeedKmh = 25.0,
+            bikeWeightKg = 26.0,
+            riderWeightKg = 80.0
+        )
+        physicsEngine.syncWithPreferences(customPrefs)
+
+        val updatedTelem = physicsEngine.getBatteryTelemetry()
+        assertEquals(750.0, updatedTelem.maxWh, 0.001)
+        assertEquals(750.0, updatedTelem.currentWh, 0.001)
+        assertEquals(100, updatedTelem.percentage)
+        assertTrue(
+            "Higher battery capacity should provide greater estimated range",
+            updatedTelem.estimatedRangeKm > initialTelem.estimatedRangeKm
+        )
+        assertEquals(25.0, physicsEngine.getConfig().maxAssistSpeedKmh, 0.001)
+    }
 }
