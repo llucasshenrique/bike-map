@@ -25,6 +25,7 @@ fun NavigationHud(
     distanceToNextManeuverMeters: Int,
     telemetry: LiveRideTelemetry,
     isMuted: Boolean,
+    isRerouting: Boolean = false,
     onToggleMute: () -> Unit,
     onStopNavigation: () -> Unit,
     onOpenCockpit: () -> Unit,
@@ -54,36 +55,60 @@ fun NavigationHud(
                         .background(CyanPrimary, RoundedCornerShape(14.dp)),
                     contentAlignment = Alignment.Center
                 ) {
-                    val icon = when (instruction?.maneuver) {
-                        ManeuverType.TURN_RIGHT, ManeuverType.SHARP_RIGHT, ManeuverType.SLIGHT_RIGHT -> Icons.Default.TurnRight
-                        ManeuverType.TURN_LEFT, ManeuverType.SHARP_LEFT, ManeuverType.SLIGHT_LEFT -> Icons.Default.TurnLeft
-                        ManeuverType.ROUNDABOUT -> Icons.Default.Refresh
-                        ManeuverType.CLIMB_AHEAD -> Icons.Default.TrendingUp
-                        ManeuverType.ARRIVE -> Icons.Default.Flag
-                        else -> Icons.Default.Straight
+                    if (isRerouting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(28.dp),
+                            color = Slate950,
+                            strokeWidth = 3.dp
+                        )
+                    } else {
+                        val icon = when (instruction?.maneuver) {
+                            ManeuverType.TURN_RIGHT, ManeuverType.SHARP_RIGHT, ManeuverType.SLIGHT_RIGHT -> Icons.Default.TurnRight
+                            ManeuverType.TURN_LEFT, ManeuverType.SHARP_LEFT, ManeuverType.SLIGHT_LEFT -> Icons.Default.TurnLeft
+                            ManeuverType.ROUNDABOUT -> Icons.Default.Refresh
+                            ManeuverType.CLIMB_AHEAD -> Icons.Default.TrendingUp
+                            ManeuverType.ARRIVE -> Icons.Default.Flag
+                            else -> Icons.Default.Straight
+                        }
+                        Icon(icon, contentDescription = "Manobra", tint = Slate950, modifier = Modifier.size(32.dp))
                     }
-                    Icon(icon, contentDescription = "Manobra", tint = Slate950, modifier = Modifier.size(32.dp))
                 }
 
                 Column(modifier = Modifier.weight(1f)) {
-                    val distStr = if (distanceToNextManeuverMeters >= 1000) {
-                        "${(distanceToNextManeuverMeters / 1000.0 * 10).toInt() / 10.0} km"
+                    if (isRerouting) {
+                        Text(
+                            text = "FORA DA ROTA",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = AmberWarning
+                        )
+                        Text(
+                            text = "Recalculando rota...",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            maxLines = 2
+                        )
                     } else {
-                        "$distanceToNextManeuverMeters m"
+                        val distStr = if (distanceToNextManeuverMeters >= 1000) {
+                            "${(distanceToNextManeuverMeters / 1000.0 * 10).toInt() / 10.0} km"
+                        } else {
+                            "$distanceToNextManeuverMeters m"
+                        }
+                        Text(
+                            text = "EM $distStr",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = CyanGlow
+                        )
+                        Text(
+                            text = instruction?.text ?: "Siga em frente",
+                            fontSize = 16.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            maxLines = 2
+                        )
                     }
-                    Text(
-                        text = "EM $distStr",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = CyanGlow
-                    )
-                    Text(
-                        text = instruction?.text ?: "Siga em frente",
-                        fontSize = 16.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
-                        maxLines = 2
-                    )
                 }
 
                 // Voice Mute button
