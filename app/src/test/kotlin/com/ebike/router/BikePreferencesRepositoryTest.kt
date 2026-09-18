@@ -92,4 +92,48 @@ class BikePreferencesRepositoryTest {
         val updated = repository.bikePreferencesFlow.first()
         assertEquals(300.0, updated.currentBatteryWh, 0.001)
     }
+
+    @Test
+    fun testUpdateBikeSpecsClampsCurrentBatteryWhenCapacityReduced() = runBlocking {
+        val initial = repository.bikePreferencesFlow.first()
+        assertEquals(500.0, initial.currentBatteryWh, 0.001)
+
+        repository.updateBikeSpecs(
+            batteryCapacityWh = 350.0,
+            maxAssistSpeedKmh = 32.0,
+            bikeWeightKg = 24.0,
+            riderWeightKg = 75.0
+        )
+
+        val updated = repository.bikePreferencesFlow.first()
+        assertEquals(350.0, updated.batteryCapacityWh, 0.001)
+        assertEquals(
+            "Current battery must be clamped to new capacity if previous current Wh exceeded it",
+            350.0,
+            updated.currentBatteryWh,
+            0.001
+        )
+    }
+
+    @Test
+    fun testUpdateBikeSpecsDoesNotInflateCurrentBattery() = runBlocking {
+        repository.updateCurrentBatteryWh(150.0)
+        assertEquals(150.0, repository.bikePreferencesFlow.first().currentBatteryWh, 0.001)
+
+        repository.updateBikeSpecs(
+            batteryCapacityWh = 750.0,
+            maxAssistSpeedKmh = 32.0,
+            bikeWeightKg = 24.0,
+            riderWeightKg = 75.0
+        )
+
+        val updated = repository.bikePreferencesFlow.first()
+        assertEquals(750.0, updated.batteryCapacityWh, 0.001)
+        assertEquals(
+            "Current battery Wh should remain 150.0 when capacity is increased",
+            150.0,
+            updated.currentBatteryWh,
+            0.001
+        )
+    }
 }

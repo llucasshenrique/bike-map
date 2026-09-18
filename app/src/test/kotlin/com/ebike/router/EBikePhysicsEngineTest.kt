@@ -99,4 +99,102 @@ class EBikePhysicsEngineTest {
         )
         assertEquals(25.0, physicsEngine.getConfig().maxAssistSpeedKmh, 0.001)
     }
+
+    @Test
+    fun testSyncWithPreferencesDisablesAssistWhenEBikeModeIsFalse() {
+        physicsEngine.setAssistLevel(AssistLevel.TURBO)
+        assertEquals(AssistLevel.TURBO, physicsEngine.getConfig().activeAssist)
+
+        val normalBikePrefs = com.ebike.router.data.UserBikePreferences(
+            isEBikeMode = false,
+            batteryCapacityWh = 500.0,
+            currentBatteryWh = 500.0
+        )
+        physicsEngine.syncWithPreferences(normalBikePrefs)
+
+        assertEquals(
+            "When e-bike mode is false, active assist must be forced to OFF",
+            AssistLevel.OFF,
+            physicsEngine.getConfig().activeAssist
+        )
+    }
+
+    @Test
+    fun testUpdateBatteryWhClamping() {
+        // Upper bound clamp
+        physicsEngine.updateBatteryWh(9999.0)
+        assertEquals(physicsEngine.getConfig().batteryCapacityWh, physicsEngine.getConfig().currentBatteryWh, 0.001)
+
+        // Lower bound clamp
+        physicsEngine.updateBatteryWh(-50.0)
+        assertEquals(0.0, physicsEngine.getConfig().currentBatteryWh, 0.001)
+
+        // Within bounds
+        physicsEngine.updateBatteryWh(300.0)
+        assertEquals(300.0, physicsEngine.getConfig().currentBatteryWh, 0.001)
+    }
+
+    @Test
+    fun testBatteryTelemetryVoltageAndRange() {
+        physicsEngine.updateBatteryWh(0.0)
+        val emptyTelem = physicsEngine.getBatteryTelemetry()
+        assertEquals(0, emptyTelem.percentage)
+        assertEquals(0.0, emptyTelem.estimatedRangeKm, 0.001)
+        assertEquals(30.6, emptyTelem.voltageApprox, 0.001) // 36 * 0.85
+
+        physicsEngine.updateBatteryWh(physicsEngine.getConfig().batteryCapacityWh)
+        val fullTelem = physicsEngine.getBatteryTelemetry()
+        assertEquals(100, fullTelem.percentage)
+        assertEquals(36.0, fullTelem.voltageApprox, 0.001) // 36 * 1.0
+        assertEquals(com.ebike.router.model.TelemetryOrigin.SIMULATED_ESTIMATE, fullTelem.origin)
+    }
+
+    @Test
+    fun testEstimatedRangeZeroWhenAssistIsOff() {
+        physicsEngine.setAssistLevel(AssistLevel.OFF)
+        val telem = physicsEngine.getBatteryTelemetry()
+        assertEquals(0.0, telem.estimatedRangeKm, 0.001)
+    }
+
+    @Test
+    fun testRegenerativeBrakingDisabledProducesNoRegen() {
+        val nonRegenConfig = physicsEngine.getConfig().copy(regenerativeBraking = false)
+        physicsEngine.updateConfig(nonRegenConfig)
+
+        val result = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = -6.0,
+            targetSpeedKmh = 25.0,
+            assistLevel = AssistLevel.TOUR
+        )
+        assertEquals("Energy should be 0 when regenerative braking is disabled", 0.0, result.energyWh, 0.001)
+    }
+
+    @Test
+    fun testDownhillGentleSlopeProducesNoRegen() {
+        val regenConfig = physicsEngine.getConfig().copy(regenerativeBraking = true)
+        physicsEngine.updateConfig(regenConfig)
+
+        // Gentle downhill (grade >= -3.0%)
+        val result = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = -2.0,
+            targetSpeedKmh = 25.0,
+            assistLevel = AssistLevel.TOUR
+        )
+        assertEquals("Gentle slopes (>= -3%) should not trigger regen", 0.0, result.energyWh, 0.001)
+    }
+
+    @Test
+    fun testMotorPowerCappedAtMaxWatt() {
+        // High resistance climb with Turbo assist
+        val result = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 500.0,
+            gradePercent = 15.0,
+            targetSpeedKmh = 30.0,
+            assistLevel = AssistLevel.TURBO
+        )
+        assertTrue("Motor power should not exceed motorMaxWatt (350W)", result.motorWatt <= 350)
+        assertTrue("Motor should be delivering power", result.motorWatt > 0)
+    }
 }

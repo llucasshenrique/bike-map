@@ -59,4 +59,36 @@ class GraphRouterServiceTest {
         assertTrue("E-bike mode must report positive battery drain percent", route.batteryDrainPercent > 0.0)
         assertTrue("E-bike mode battery remaining should be positive", route.estimatedBatteryRemainingWh > 0)
     }
+
+    @Test
+    fun testEmptyOrSinglePointReturnsEmptyList() = runBlocking {
+        val emptyResult = routerService.calculateMultipleRoutes(emptyList(), RoutingProfile.EFFICIENT)
+        assertTrue("Empty points list must return empty routes", emptyResult.isEmpty())
+
+        val singlePointResult = routerService.calculateMultipleRoutes(
+            listOf(GeoPoint(-23.5505, -46.6333, 20.0)),
+            RoutingProfile.EFFICIENT
+        )
+        assertTrue("Single point list must return empty routes", singlePointResult.isEmpty())
+    }
+
+    @Test
+    fun testDirectRouteSegmentNamingAndProfileVariations() = runBlocking {
+        val points = listOf(
+            GeoPoint(-23.5505, -46.6333, 20.0),
+            GeoPoint(-23.5550, -46.6380, 25.0)
+        )
+
+        for (profile in RoutingProfile.values()) {
+            val normalRoutes = routerService.calculateMultipleRoutes(points, profile, isEBikeMode = false)
+            assertTrue("Normal bike mode route must be generated for profile $profile", normalRoutes.isNotEmpty())
+            val normalRoute = normalRoutes.first()
+            assertEquals("Normal bike mode energy must be 0", 0.0, normalRoute.totalEnergyWh, 0.001)
+
+            val eBikeRoutes = routerService.calculateMultipleRoutes(points, profile, isEBikeMode = true)
+            assertTrue("E-bike route must be generated for profile $profile", eBikeRoutes.isNotEmpty())
+            val eBikeRoute = eBikeRoutes.first()
+            assertTrue("E-bike energy must be positive for profile $profile", eBikeRoute.totalEnergyWh > 0.0)
+        }
+    }
 }
