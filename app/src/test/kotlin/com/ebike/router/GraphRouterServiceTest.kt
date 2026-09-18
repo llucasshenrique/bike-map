@@ -73,6 +73,63 @@ class GraphRouterServiceTest {
     }
 
     @Test
+    fun testTogglingModeOffMidRideStopsBatteryDrainOnNextRouteCalculation() = runBlocking {
+        val points = listOf(
+            GeoPoint(-23.5505, -46.6333, 20.0),
+            GeoPoint(-23.5550, -46.6380, 25.0)
+        )
+
+        // Rider starts navigating with e-bike mode on (leftover assist state on the
+        // shared physics engine instance, same as the long-lived engine held by the
+        // app's ViewModel across the whole ride).
+        physicsEngine.setAssistLevel(com.ebike.router.model.AssistLevel.TURBO)
+        val ebikeRoutes = routerService.calculateMultipleRoutes(points, RoutingProfile.EFFICIENT, isEBikeMode = true)
+        val ebikeRoute = ebikeRoutes.first()
+        assertTrue("Energy should be positive while e-bike mode is on", ebikeRoute.totalEnergyWh > 0.0)
+
+        // Rider toggles e-bike mode off mid-ride; router must gate on the flag passed
+        // in, not leftover engine state (activeAssist is still TURBO on the engine).
+        val normalRoutes = routerService.calculateMultipleRoutes(points, RoutingProfile.EFFICIENT, isEBikeMode = false)
+        val normalRoute = normalRoutes.first()
+        assertEquals(
+            "Energy must be 0 immediately after toggling e-bike mode off mid-ride, regardless of leftover engine assist state",
+            0.0,
+            normalRoute.totalEnergyWh,
+            0.001
+        )
+        assertEquals(0.0, normalRoute.batteryDrainPercent, 0.001)
+        assertEquals(0, normalRoute.estimatedBatteryRemainingWh)
+    }
+
+    @Test
+    fun testZeroBatteryCapacityRouteDoesNotCrashOrProduceInvalidPercentages() = runBlocking {
+        val points = listOf(
+            GeoPoint(-23.5505, -46.6333, 20.0),
+            GeoPoint(-23.5550, -46.6380, 25.0)
+        )
+
+        physicsEngine.updateConfig(physicsEngine.getConfig().copy(batteryCapacityWh = 0.0, currentBatteryWh = 0.0))
+
+        val routes = routerService.calculateMultipleRoutes(points, RoutingProfile.EFFICIENT, isEBikeMode = true)
+        assertTrue("Should still produce at least one route", routes.isNotEmpty())
+
+        val route = routes.first()
+        assertFalse("Battery drain percent must not be NaN with 0 capacity", route.batteryDrainPercent.isNaN())
+        assertFalse("Battery drain percent must not be infinite with 0 capacity", route.batteryDrainPercent.isInfinite())
+        assertEquals(
+            "Battery drain percent must be reported as 0 (not computed) when capacity is 0",
+            0.0,
+            route.batteryDrainPercent,
+            0.001
+        )
+        assertEquals(
+            "Remaining battery percent must be reported as 0 when capacity is 0",
+            0,
+            route.batteryRemainingPercent
+        )
+    }
+
+    @Test
     fun testDirectRouteSegmentNamingAndProfileVariations() = runBlocking {
         val points = listOf(
             GeoPoint(-23.5505, -46.6333, 20.0),

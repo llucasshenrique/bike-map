@@ -116,6 +116,85 @@ class BikePreferencesRepositoryTest {
     }
 
     @Test
+    fun testUpdateBikeSpecsWithZeroBatteryCapacityDoesNotProduceNegativeCurrentBattery() = runBlocking {
+        repository.updateBikeSpecs(
+            batteryCapacityWh = 0.0,
+            maxAssistSpeedKmh = 32.0,
+            bikeWeightKg = 24.0,
+            riderWeightKg = 75.0
+        )
+
+        val updated = repository.bikePreferencesFlow.first()
+        assertTrue("Battery capacity must be coerced to a positive value, never 0/negative", updated.batteryCapacityWh > 0.0)
+        assertTrue("Current battery Wh must never go negative", updated.currentBatteryWh >= 0.0)
+        assertTrue(
+            "Current battery Wh must never exceed the (coerced) capacity",
+            updated.currentBatteryWh <= updated.batteryCapacityWh
+        )
+    }
+
+    @Test
+    fun testUpdateBikeSpecsWithNegativeBatteryCapacityIsCoercedToSafeMinimum() = runBlocking {
+        repository.updateBikeSpecs(
+            batteryCapacityWh = -250.0,
+            maxAssistSpeedKmh = 32.0,
+            bikeWeightKg = 24.0,
+            riderWeightKg = 75.0
+        )
+
+        val updated = repository.bikePreferencesFlow.first()
+        assertTrue(
+            "Negative battery capacity input must never be persisted as-is",
+            updated.batteryCapacityWh > 0.0
+        )
+        assertTrue("Current battery Wh must never go negative", updated.currentBatteryWh >= 0.0)
+        assertTrue(
+            "Current battery Wh must never exceed the (coerced) capacity",
+            updated.currentBatteryWh <= updated.batteryCapacityWh
+        )
+    }
+
+    @Test
+    fun testUpdateCurrentBatteryWhRejectsNegativeInput() = runBlocking {
+        repository.updateBikeSpecs(
+            batteryCapacityWh = 400.0,
+            maxAssistSpeedKmh = 32.0,
+            bikeWeightKg = 24.0,
+            riderWeightKg = 75.0
+        )
+
+        repository.updateCurrentBatteryWh(-75.0)
+
+        val updated = repository.bikePreferencesFlow.first()
+        assertEquals(
+            "Negative currentBatteryWh writes must be clamped to 0",
+            0.0,
+            updated.currentBatteryWh,
+            0.001
+        )
+    }
+
+    @Test
+    fun testUpdateCurrentBatteryWhCannotExceedCapacity() = runBlocking {
+        repository.updateBikeSpecs(
+            batteryCapacityWh = 400.0,
+            maxAssistSpeedKmh = 32.0,
+            bikeWeightKg = 24.0,
+            riderWeightKg = 75.0
+        )
+
+        repository.updateCurrentBatteryWh(9999.0)
+
+        val updated = repository.bikePreferencesFlow.first()
+        assertEquals(
+            "currentBatteryWh writes above capacity must be clamped to capacity",
+            400.0,
+            updated.currentBatteryWh,
+            0.001
+        )
+    }
+
+    @Test
     fun testUpdateBikeSpecsDoesNotInflateCurrentBattery() = runBlocking {
         repository.updateCurrentBatteryWh(150.0)
         assertEquals(150.0, repository.bikePreferencesFlow.first().currentBatteryWh, 0.001)

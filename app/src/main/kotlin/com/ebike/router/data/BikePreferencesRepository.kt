@@ -28,6 +28,11 @@ class BikePreferencesRepository(
     constructor(context: Context) : this(context.bikeDataStore)
 
     companion object {
+        // Battery capacity must stay strictly positive: it is used as a divisor
+        // (percentage, range) downstream and a zero/negative value would corrupt
+        // currentBatteryWh via the clamp below.
+        const val MIN_BATTERY_CAPACITY_WH = 1.0
+
         val KEY_IS_EBIKE_MODE = booleanPreferencesKey("is_ebike_mode")
         val KEY_BATTERY_CAPACITY_WH = doublePreferencesKey("battery_capacity_wh")
         val KEY_CURRENT_BATTERY_WH = doublePreferencesKey("current_battery_wh")
@@ -62,22 +67,22 @@ class BikePreferencesRepository(
         riderWeightKg: Double,
         regenerativeBraking: Boolean = false
     ) {
+        val safeCapacityWh = if (batteryCapacityWh > 0.0) batteryCapacityWh else MIN_BATTERY_CAPACITY_WH
         dataStore.edit { prefs ->
-            prefs[KEY_BATTERY_CAPACITY_WH] = batteryCapacityWh
+            prefs[KEY_BATTERY_CAPACITY_WH] = safeCapacityWh
             prefs[KEY_MAX_ASSIST_SPEED_KMH] = maxAssistSpeedKmh
             prefs[KEY_BIKE_WEIGHT_KG] = bikeWeightKg
             prefs[KEY_RIDER_WEIGHT_KG] = riderWeightKg
             prefs[KEY_REGENERATIVE_BRAKING] = regenerativeBraking
             val current = prefs[KEY_CURRENT_BATTERY_WH] ?: 500.0
-            if (current > batteryCapacityWh) {
-                prefs[KEY_CURRENT_BATTERY_WH] = batteryCapacityWh
-            }
+            prefs[KEY_CURRENT_BATTERY_WH] = current.coerceIn(0.0, safeCapacityWh)
         }
     }
 
     suspend fun updateCurrentBatteryWh(currentWh: Double) {
         dataStore.edit { prefs ->
-            prefs[KEY_CURRENT_BATTERY_WH] = currentWh
+            val capacity = prefs[KEY_BATTERY_CAPACITY_WH] ?: 500.0
+            prefs[KEY_CURRENT_BATTERY_WH] = currentWh.coerceIn(0.0, capacity)
         }
     }
 }

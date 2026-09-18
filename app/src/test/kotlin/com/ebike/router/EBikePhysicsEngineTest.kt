@@ -186,6 +186,82 @@ class EBikePhysicsEngineTest {
     }
 
     @Test
+    fun testZeroBatteryCapacityProducesSafeTelemetryNoCrash() {
+        val zeroCapConfig = physicsEngine.getConfig().copy(batteryCapacityWh = 0.0, currentBatteryWh = 0.0)
+        physicsEngine.updateConfig(zeroCapConfig)
+
+        val telem = physicsEngine.getBatteryTelemetry()
+        assertEquals("Percentage must not be negative or NaN-derived with 0 capacity", 0, telem.percentage)
+        assertTrue("Percentage must stay within [0, 100] even with 0 capacity", telem.percentage in 0..100)
+        assertTrue("Estimated range must never be negative", telem.estimatedRangeKm >= 0.0)
+        assertFalse("Estimated range must not be NaN", telem.estimatedRangeKm.isNaN())
+        assertFalse("Estimated range must not be infinite", telem.estimatedRangeKm.isInfinite())
+    }
+
+    @Test
+    fun testNegativeBatteryCapacityDoesNotCrashAndKeepsPercentageInBounds() {
+        val negativeCapConfig = physicsEngine.getConfig().copy(batteryCapacityWh = -300.0, currentBatteryWh = 50.0)
+        physicsEngine.updateConfig(negativeCapConfig)
+
+        val telem = physicsEngine.getBatteryTelemetry()
+        assertTrue("Percentage must stay within [0, 100] even with negative capacity", telem.percentage in 0..100)
+        assertTrue("Estimated range must never be negative", telem.estimatedRangeKm >= 0.0)
+    }
+
+    @Test
+    fun testNegativeCurrentBatteryNeverProducesNegativeEstimatedRange() {
+        // Simulates corrupted/out-of-band state reaching the engine directly
+        // (e.g. via a bad preferences sync), bypassing updateBatteryWh's own clamp.
+        val corruptedConfig = physicsEngine.getConfig().copy(currentBatteryWh = -50.0)
+        physicsEngine.updateConfig(corruptedConfig)
+
+        val telem = physicsEngine.getBatteryTelemetry()
+        assertTrue(
+            "Estimated range must be clamped to >= 0 even if currentBatteryWh is negative",
+            telem.estimatedRangeKm >= 0.0
+        )
+    }
+
+    @Test
+    fun testTogglingModeOffMidRideImmediatelyZeroesEnergyAndMotorPower() {
+        // Start a "ride" in e-bike mode with a strong assist level.
+        physicsEngine.setAssistLevel(AssistLevel.TURBO)
+        val duringRide = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 500.0,
+            gradePercent = 3.0,
+            targetSpeedKmh = 28.0
+        )
+        assertTrue("Energy should be positive while e-bike mode is active", duringRide.energyWh > 0.0)
+        assertTrue("Motor should be delivering power while e-bike mode is active", duringRide.motorWatt > 0)
+
+        // Rider toggles e-bike mode OFF mid-ride via the same preferences sync path
+        // the app uses (BikeMapViewModel collects bikePreferencesFlow -> syncWithPreferences).
+        val prefsAfterToggleOff = com.ebike.router.data.UserBikePreferences(isEBikeMode = false)
+        physicsEngine.syncWithPreferences(prefsAfterToggleOff)
+
+        val afterToggleOff = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 500.0,
+            gradePercent = 3.0,
+            targetSpeedKmh = 28.0
+        )
+        assertEquals(
+            "Energy must drop to 0 Wh immediately once e-bike mode is toggled off mid-ride",
+            0.0,
+            afterToggleOff.energyWh,
+            0.001
+        )
+        assertEquals(
+            "Motor power must drop to 0 immediately once e-bike mode is toggled off mid-ride",
+            0,
+            afterToggleOff.motorWatt
+        )
+        assertTrue(
+            "Rider must still be shown supplying power (human-only propulsion) once assist is off",
+            afterToggleOff.riderWatt > 0
+        )
+    }
+
+    @Test
     fun testMotorPowerCappedAtMaxWatt() {
         // High resistance climb with Turbo assist
         val result = physicsEngine.calculateSegmentEnergy(

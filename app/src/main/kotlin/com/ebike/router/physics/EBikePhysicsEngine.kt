@@ -45,7 +45,7 @@ class EBikePhysicsEngine(
     fun getBatteryTelemetry(): BatteryTelemetry {
         val pct = max(0, min(100, ((config.currentBatteryWh / max(1.0, config.batteryCapacityWh)) * 100).toInt()))
         val avgWhPerKm = getAverageWhPerKm(config.activeAssist)
-        val rangeKm = if (avgWhPerKm > 0) config.currentBatteryWh / avgWhPerKm else 0.0
+        val rangeKm = if (avgWhPerKm > 0) max(0.0, config.currentBatteryWh / avgWhPerKm) else 0.0
         val voltage = 36.0 * (0.85 + 0.15 * (pct / 100.0))
 
         return BatteryTelemetry(
