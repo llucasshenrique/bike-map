@@ -45,6 +45,7 @@ fun RoutePlannerSheet(
     onSelectRoute: (Int) -> Unit,
     onStartNavigation: (RouteResult) -> Unit,
     onStartSimulation: (RouteResult) -> Unit,
+    onSaveRoute: (() -> Unit)? = null,
     onClose: () -> Unit,
     estimatedOfflineTiles: Int = 0,
     downloadProgress: OfflineDownloadState = OfflineDownloadState.Idle,
@@ -189,6 +190,30 @@ fun RoutePlannerSheet(
 
                         // Actions
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            IconButton(
+                                onClick = { onMoveWaypoint(idx, idx - 1) },
+                                enabled = idx > 0,
+                                modifier = Modifier.size(32.dp).background(Slate700, RoundedCornerShape(6.dp))
+                            ) {
+                                Icon(
+                                    Icons.Default.KeyboardArrowUp,
+                                    contentDescription = "Mover para cima",
+                                    tint = if (idx > 0) Color.White else Slate700,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            IconButton(
+                                onClick = { onMoveWaypoint(idx, idx + 1) },
+                                enabled = idx < waypoints.size - 1,
+                                modifier = Modifier.size(32.dp).background(Slate700, RoundedCornerShape(6.dp))
+                            ) {
+                                Icon(
+                                    Icons.Default.KeyboardArrowDown,
+                                    contentDescription = "Mover para baixo",
+                                    tint = if (idx < waypoints.size - 1) Color.White else Slate700,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                             IconButton(
                                 onClick = { onPickOnMap(idx) },
                                 modifier = Modifier.size(32.dp).background(if (isPicking) CyanPrimary else Slate700, RoundedCornerShape(6.dp))
@@ -361,6 +386,22 @@ fun RoutePlannerSheet(
                 )
 
                 Spacer(modifier = Modifier.height(12.dp))
+
+                // Save Route Button
+                onSaveRoute?.let { saveAction ->
+                    OutlinedButton(
+                        onClick = saveAction,
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AmberWarning),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AmberWarning.copy(alpha = 0.6f))
+                    ) {
+                        Icon(Icons.Default.BookmarkAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Salvar Rota nos Favoritos", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
 
                 // Action Buttons
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {

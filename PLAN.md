@@ -1,74 +1,429 @@
-# Plan: Real Offline Map Tile Caching
+# Implementation Plan: Ride History & Saved/Favorite Routes Persistence
 
-## Problem
+## 1. Executive Summary & Architecture Philosophy
 
-`SplashScreenOverlay.kt:120` displays "Iniciando GPS e mapas offline..." ("Starting GPS and offline maps...") but `OsmdroidMapView.kt` never configures osmdroid's tile cache, base path, or cache expiration policy. It calls `Configuration.getInstance().userAgentValue = ...` and `setTileSource(TileSourceFactory.MAPNIK)` and nothing else. In practice this means:
+The application (`com.ebike.router`) is an Android Kotlin/Jetpack Compose navigation and routing app. Its primary architecture philosophy is **normal-bike-first**, featuring an **opt-in e-bike mode** (with battery drain modeling, assist level scaling, and motor wattage physics).
 
-- osmdroid falls back to its internal default cache dir/size, which is not app-scoped, not sized deliberately, and not guaranteed to survive without storage cleanup.
-- There is no way for a rider to pre-fetch tiles for a planned route before losing connectivity.
-- There is no cache size ceiling, eviction policy, or user-visible storage management.
-- Tiles are never served from a bundled/offline source — `MAPNIK` always attempts network fetch first.
+Currently, the app has **zero local persistence** — no Room, DataStore, or SharedPreferences. If the user closes the app or finishes a ride, all route computations, waypoints, and ride telemetry disappear immediately.
 
-This plan makes "offline maps" true: explicit disk cache configuration, a bulk region-download affordance tied to the route planner, storage/quota management, and a defined interaction between the live MAPNIK network source and the offline cache.
+This document outlines a production-ready implementation plan to introduce local database persistence using **Jetpack Room** and **Kotlin Coroutines / Flow**, covering:
+1. **Ride History Persistence**: Logging completed rides (distance, duration, avg/max speed, elevation gain/loss, polyline path, and optional e-bike metrics).
+2. **Saved / Favorite Routes**: Storing multi-stop itineraries with profile preference, waypoints, and polyline previews.
+3. **Saved / Favorite Destinations**: Storing frequent places (Home, Work, Trails) for 1-tap waypoint selection in search dialogs.
 
-## 1. osmdroid tile cache / base path configuration
+---
 
-In `OsmdroidMapView.kt`, inside the existing `DisposableEffect(Unit)` (before any `MapView` is constructed), configure the shared `Configuration.getInstance()` singleton:
+## 2. Dependencies & Build Configuration (`build.gradle.kts`)
 
-- `osmdroidBasePath`: `File(context.filesDir, "osmdroid")` — app-private, no storage permission needed, survives across app restarts, cleared on uninstall (acceptable for a tile cache).
-- `osmdroidTileCache`: `File(osmdroidBasePath, "tiles")` — osmdroid's `SqlTileWriter` (the default `IFilesystemCache` used by osmdroid ≥6.x) stores tiles in a single SQLite DB (`cache.db`) at this path instead of thousands of loose PNG files. This is already osmdroid's default writer as of 6.1.x — the win here is *pointing it at a deliberate, app-scoped path* rather than the OS default (which on many devices resolves to shared external storage and requires legacy storage permissions on API ≤28, or silently fails on scoped storage from API 29+).
-- `Configuration.getInstance().tileFileSystemCacheMaxBytes` / `tileFileSystemCacheTrimBytes`: set explicit soft/hard cache size limits (see §3).
-- `Configuration.getInstance().expirationOverrideDuration`: set a long override (e.g. 30 days) so tiles already on disk are served immediately without a network revalidation round-trip when the device is offline — osmdroid's default HTTP cache-control handling will otherwise try to hit the network per tile and only fall back to the stale cache on failure/timeout, which is slow when offline.
-- Call `Configuration.getInstance().load(context, PreferenceManager.getDefaultSharedPreferences(context))` before setting the above, since `load()` will overwrite fields with persisted prefs if called after.
+### 2.1 Root `build.gradle.kts`
+Add the Kotlin Symbol Processing (KSP) plugin matching Kotlin `2.0.21`:
+```kotlin
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+}
+```
 
-This alone fixes "tiles get cached at all, in a sane place, with a size cap" for normal online browsing (osmdroid caches every tile it fetches as a side effect of panning). It does **not** give a rider pre-downloaded coverage for a route they haven't scrolled through yet — that requires an explicit bulk download (§2).
+### 2.2 `app/build.gradle.kts`
+Apply the KSP plugin and add Room dependencies:
+```kotlin
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
 
-## 2. Explicit region pre-download for a planned route
+dependencies {
+    // Existing:
+    // ...
+    // implementation("com.google.code.gson:gson:2.11.0")
 
-osmdroid ships `org.osmdroid.tileprovider.cachemanager.CacheManager`, built for exactly this: given a `MapView`, a `BoundingBox`, and a zoom range, it enumerates the needed tiles and downloads+writes them into the configured `SqlTileWriter`, reporting progress via a listener.
+    // Room Persistence
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+}
+```
 
-### Where it hooks in
+---
 
-- `RouteResult` (`RoutingModels.kt:67`) already carries `coordinates` and a computed bounding box is derivable the same way `OsmdroidMapView.kt:220-228` does it for `zoomToBoundingBox` (min/max lat/lng + padding).
-- Add a new service, `OfflineTileCacheService` (parallel to existing `service/` classes like `GraphRouterService`), wrapping `CacheManager`:
-  - `estimateTileCount(bbox: BoundingBox, minZoom: Int, maxZoom: Int): Int` — calls `CacheManager.possibleTilesInArea(...)` (or manually sums `4^(z2-z1)` per grid cell osmdroid exposes) so the UI can show "~840 tiles / ~42 MB" before committing.
-  - `downloadRegion(bbox, minZoom, maxZoom, onProgress: (downloaded: Int, total: Int) -> Unit, onDone: (success: Boolean) -> Unit)` — wraps `CacheManager.downloadAreaAsync(activity, bbox, minZoom, maxZoom, callback)`.
-- Zoom range: pick a fixed practical band, e.g. 12–17 (city/route-following zooms), not the full 0–19, to keep tile counts bounded. Buffer the bounding box by ~1–2 km beyond the route polyline (not just the existing 0.005° pad used for camera framing) so minor reroutes/off-route excursions still hit cached tiles.
-- `MAPNIK`'s usage policy requires attribution and reasonable bulk-download behavior — throttle concurrent downloads (osmdroid's `CacheManager` already serializes via its own executor) and warn the user this uses their data connection; do not parallelize beyond osmdroid's defaults.
+## 3. Data Model & Room Entities
 
-### UI affordance
+To respect the **normal-bike-first** principle, all e-bike-specific telemetry fields (such as `energyConsumedWh`, `batteryDrainPercent`, and `assistLevel`) are **nullable**. When a rider completes a regular bike ride, e-bike metrics are `null`, avoiding artificial zero-battery entries.
 
-- In `RoutePlannerSheet.kt`, once a `RouteResult` exists (same place `onCalculateRoute`/`onStartNavigation` live), add a "Baixar mapa offline" (Download offline map) button/row showing estimated tile count and size.
-- Tapping it calls into the ViewModel (`BikeMapViewModel.kt`), which owns a new `downloadProgress: StateFlow<OfflineDownloadState>` (idle / running(current, total) / done / error) exposed to the sheet as a progress bar, mirroring how `isCalculating` is already surfaced.
-- `MainActivity`/`OsmdroidMapView` doesn't need changes beyond exposing the live `MapView` instance (already held in `mapViewRef`, but that's local to the composable — the download doesn't strictly need a live `MapView`; `CacheManager` can be constructed from a throwaway `MapView` or, in newer osmdroid, from the tile provider directly). Confirm osmdroid 6.1.20's `CacheManager(MapView)` constructor requirement — if it requires an attached `MapView`, reuse `mapViewRef` via a callback rather than instantiating a second one.
-- Post-download, surface a small "mapa offline disponível" indicator on the route preview card so the rider knows before departure that this route is safe offline.
+### 3.1 Entity: `RideHistoryEntity`
+Stores completed or recorded rides.
 
-## 3. Storage / size management
+```kotlin
+package com.ebike.router.data.local.entity
 
-- Set a hard ceiling via `Configuration.getInstance().tileFileSystemCacheMaxBytes` (e.g. 500 MB) and `tileFileSystemCacheTrimBytes` (e.g. 400 MB) so ordinary pan/zoom browsing self-trims (osmdroid's `SqlTileWriter` runs LRU eviction against these thresholds automatically).
-- For explicit region downloads, treat them as a distinct "pinned" concern from the general LRU cache:
-  - Simplest approach given osmdroid's storage model (single shared `cache.db`, no per-tile pinning API): before starting a region download, check `SqlTileWriter().getSize()` (or equivalent DB file size) against a separate "reserved for offline routes" budget (e.g. cap total offline-route downloads at 300 MB, independent from but bounded within the 500 MB overall ceiling) and warn/block if exceeded.
-  - Because osmdroid has no built-in "protect these tiles from LRU eviction" flag, downloaded offline tiles can still be evicted by later ordinary browsing if the shared cache fills up. Document this limitation to the user (a badge that says "may need re-download if unused for a while") rather than pretending permanence, or mitigate by giving downloaded-route tiles their own separate `SqlTileWriter`/DB file at a distinct path and a custom tile source that checks the offline DB first, falling back to the shared cache — more work, but the only way to get real pinning. Recommend starting with the shared-cache approach and revisiting per-route DBs only if eviction turns out to be a real problem in practice.
-- Add a simple settings/storage screen (or a row in the existing cockpit dialog) showing total offline cache size with a "Limpar mapas offline" (clear offline maps) action that deletes the `osmdroidTileCache` directory and re-initializes it — reuse `TelemetryCockpitDialog.kt` as the natural home since it's already the app's "device/status" surface.
+import androidx.room.Entity
+import androidx.room.PrimaryKey
 
-## 4. Interaction with the existing MAPNIK source
+@Entity(tableName = "ride_history")
+data class RideHistoryEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val title: String,                          // e.g. "Pedal Matinal", "Parque Ibirapuera", or custom name
+    val timestampMillis: Long,                  // Start timestamp (System.currentTimeMillis())
+    val distanceMeters: Int,                    // Total distance traveled
+    val durationSeconds: Int,                   // Total elapsed active ride time
+    val avgSpeedKmh: Double,                    // Calculated average speed
+    val maxSpeedKmh: Double,                    // Peak speed recorded
+    val elevationGainM: Int,                    // Total meters climbed
+    val elevationLossM: Int,                    // Total meters descended
+    val routePolyline: String,                  // JSON array or Encoded Polyline (GeoPoint list)
+    val startAddress: String? = null,           // Human-readable origin label
+    val endAddress: String? = null,             // Human-readable destination label
+    
+    // Normal-bike-first vs E-bike opt-in attributes:
+    val isEBikeMode: Boolean = false,           // False for regular acoustic bikes, true if e-bike mode was used
+    val assistLevel: String? = null,            // AssistLevel name (OFF, ECO, TOUR, SPORT, TURBO) or null
+    val energyConsumedWh: Double? = null,       // Wh consumed during ride (null if standard bike)
+    val batteryDrainPercent: Double? = null     // Percentage drain (null if standard bike)
+)
+```
 
-- Keep `TileSourceFactory.MAPNIK` as the active source — no need to swap to a custom/bundled tile source. osmdroid's `MapTileProviderBasic` already checks the configured `IFilesystemCache` before making an HTTP request for any given tile/zoom/source combination; tiles pre-fetched by `CacheManager` for `MAPNIK` at a given zoom will transparently be served from disk when the network is unavailable, with zero changes to the render path.
-- Caveat: the cache key includes tile source name, so pre-downloaded tiles are only reused if the user never switches tile providers. Since the app only ever uses MAPNIK today, this is a non-issue — just don't introduce a second tile source without accounting for doubled cache usage.
-- With `expirationOverrideDuration` set (§1), osmdroid will serve cached tiles immediately rather than attempting a network revalidation, which is what makes true offline (airplane-mode) map viewing work — without it, tile requests can stall waiting on a timed-out network call before falling back to cache.
-- No manifest changes needed beyond what exists (`INTERNET` permission already present for the download itself); no additional storage permission required since the cache lives under `context.filesDir`.
+### 3.2 Entity: `SavedRouteEntity`
+Stores complete multi-waypoint itineraries that users want to repeat.
 
-## Suggested file-level changes (for the follow-up implementation pass)
+```kotlin
+package com.ebike.router.data.local.entity
 
-1. `OsmdroidMapView.kt` — cache/base-path/expiration config in `DisposableEffect`.
-2. New `service/OfflineTileCacheService.kt` — `CacheManager` wrapper, size estimation, progress callback.
-3. `ui/viewmodel/BikeMapViewModel.kt` — `downloadProgress` StateFlow, `downloadOfflineRegion(route)` method, storage-size query, clear-cache method.
-4. `ui/components/RoutePlannerSheet.kt` — "Baixar mapa offline" row with estimate + progress bar.
-5. `ui/components/TelemetryCockpitDialog.kt` — offline storage usage + "Limpar mapas offline" action.
-6. `SplashScreenOverlay.kt` — no code change required once the above lands; the existing copy becomes accurate rather than aspirational.
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+import com.ebike.router.model.RoutingProfile
 
-## Open questions to resolve before implementation
+@Entity(tableName = "saved_routes")
+data class SavedRouteEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val name: String,                           // e.g. "Caminho do Trabalho (Ciclovia)"
+    val profile: RoutingProfile,                // EFFICIENT, TURBO, SCENIC, SAFE
+    val waypointsJson: String,                  // Serialized List<RouteWaypoint>
+    val polylineJson: String,                   // Serialized List<GeoPoint> for immediate rendering
+    val totalDistanceMeters: Int,
+    val totalDurationSeconds: Int,
+    val elevationGainM: Int,
+    val isFavorite: Boolean = true,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
 
-- Confirm osmdroid 6.1.20's exact `CacheManager` API surface (constructor signature, async download callback shape, `possibleTilesInArea` availability) by checking the actual library sources/javadoc, since APIs shifted across osmdroid 6.x minor versions.
-- Decide the offline-cache ceiling numbers (500 MB/400 MB/300 MB above are starting suggestions) based on target device storage expectations for this app's users.
-- Decide whether per-route pinning (separate DB) is worth the complexity now or should be a fast-follow if the shared-cache LRU eviction proves annoying in practice.
+### 3.3 Entity: `SavedDestinationEntity`
+Stores pinned destination points for rapid reuse in the search dialog and main map.
+
+```kotlin
+package com.ebike.router.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+enum class DestinationCategory {
+    HOME, WORK, FAVORITE, TRAIL, POI
+}
+
+@Entity(tableName = "saved_destinations")
+data class SavedDestinationEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val label: String,                          // e.g. "Casa", "Trabalho", "Ciclovia Pinheiros"
+    val subText: String,                        // Address or descriptive text
+    val lat: Double,
+    val lng: Double,
+    val ele: Double = 20.0,
+    val category: DestinationCategory = DestinationCategory.FAVORITE,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
+
+### 3.4 Room Type Converters
+Using the existing Gson library (`com.google.code.gson:gson:2.11.0`):
+- `RoutingProfile` <-> `String`
+- `DestinationCategory` <-> `String`
+- `List<GeoPoint>` <-> `String` (JSON or Google Polyline Algorithm)
+- `List<RouteWaypoint>` <-> `String` (JSON)
+
+---
+
+## 4. DAO & Repository Layer Design
+
+### 4.1 DAOs (`RideHistoryDao`, `SavedRouteDao`, `SavedDestinationDao`)
+
+```kotlin
+package com.ebike.router.data.local.dao
+
+import androidx.room.*
+import com.ebike.router.data.local.entity.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface RideHistoryDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRide(ride: RideHistoryEntity): Long
+
+    @Query("UPDATE ride_history SET title = :newTitle WHERE id = :id")
+    suspend fun renameRide(id: Long, newTitle: String)
+
+    @Delete
+    suspend fun deleteRide(ride: RideHistoryEntity)
+
+    @Query("DELETE FROM ride_history WHERE id = :id")
+    suspend fun deleteRideById(id: Long)
+
+    @Query("SELECT * FROM ride_history ORDER BY timestampMillis DESC")
+    fun getAllRides(): Flow<List<RideHistoryEntity>>
+
+    @Query("SELECT * FROM ride_history WHERE id = :id")
+    suspend fun getRideById(id: Long): RideHistoryEntity?
+}
+
+@Dao
+interface SavedRouteDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRoute(route: SavedRouteEntity): Long
+
+    @Query("UPDATE saved_routes SET name = :newName WHERE id = :id")
+    suspend fun renameRoute(id: Long, newName: String)
+
+    @Query("UPDATE saved_routes SET isFavorite = :isFav WHERE id = :id")
+    suspend fun setFavorite(id: Long, isFav: Boolean)
+
+    @Query("DELETE FROM saved_routes WHERE id = :id")
+    suspend fun deleteRouteById(id: Long)
+
+    @Query("SELECT * FROM saved_routes ORDER BY createdAtMillis DESC")
+    fun getAllSavedRoutes(): Flow<List<SavedRouteEntity>>
+}
+
+@Dao
+interface SavedDestinationDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDestination(destination: SavedDestinationEntity): Long
+
+    @Query("UPDATE saved_destinations SET label = :newLabel WHERE id = :id")
+    suspend fun renameDestination(id: Long, newLabel: String)
+
+    @Query("DELETE FROM saved_destinations WHERE id = :id")
+    suspend fun deleteDestinationById(id: Long)
+
+    @Query("SELECT * FROM saved_destinations ORDER BY createdAtMillis DESC")
+    fun getAllDestinations(): Flow<List<SavedDestinationEntity>>
+}
+```
+
+### 4.2 Room Database (`AppDatabase`)
+```kotlin
+@Database(
+    entities = [
+        RideHistoryEntity::class,
+        SavedRouteEntity::class,
+        SavedDestinationEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(RoomConverters::class)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun rideHistoryDao(): RideHistoryDao
+    abstract fun savedRouteDao(): SavedRouteDao
+    abstract fun savedDestinationDao(): SavedDestinationDao
+
+    companion object {
+        @Volatile private var INSTANCE: AppDatabase? = null
+        fun getInstance(context: Context): AppDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "bike_router.db"
+                ).build().also { INSTANCE = it }
+            }
+    }
+}
+```
+
+### 4.3 Repository Interface & Implementation (`BikeRepository`)
+A unified repository decoupling Room entities from UI ViewModels:
+- `val allRides: Flow<List<RideHistoryEntity>>`
+- `val savedRoutes: Flow<List<SavedRouteEntity>>`
+- `val savedDestinations: Flow<List<SavedDestinationEntity>>`
+- `suspend fun saveRide(ride: RideHistoryEntity): Long`
+- `suspend fun renameRide(id: Long, title: String)`
+- `suspend fun deleteRide(id: Long)`
+- `suspend fun saveRoute(name: String, route: RouteResult, waypoints: List<RouteWaypoint>): Long`
+- `suspend fun deleteRoute(id: Long)`
+- `suspend fun renameRoute(id: Long, newName: String)`
+- `suspend fun saveDestination(label: String, point: GeoPoint, address: String, category: DestinationCategory)`
+- `suspend fun deleteDestination(id: Long)`
+
+---
+
+## 5. ViewModel Integration & State Machine Hooks
+
+`BikeMapViewModel` is the single source of truth for the map UI and navigation state. Below are the precise locations to hook save/load operations:
+
+### 5.1 Repository Initialization
+In `BikeMapViewModel(application: Application)`:
+```kotlin
+private val database = AppDatabase.getInstance(application)
+val repository: BikeRepository = BikeRepositoryImpl(
+    database.rideHistoryDao(),
+    database.savedRouteDao(),
+    database.savedDestinationDao()
+)
+
+// Expose observable state flows to Compose UI
+val rideHistory = repository.allRides.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedRoutes = repository.savedRoutes.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedDestinations = repository.savedDestinations.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+```
+
+### 5.2 Hook 1: Ride Completion & Auto-Save Prompt
+Currently, in `BikeMapViewModel.kt`:
+- `handleRiderLocationUpdate` checks `if (distToManeuver <= 15)` on the last instruction and calls `stopNavigation()`.
+- `stopNavigation()` immediately sets `_isNavigating.value = false` and cancels `rideTimerJob`, discarding all telemetry.
+
+**Proposed Hook**:
+1. Introduce a state `val completedRideSummary = MutableStateFlow<RideHistoryEntity?>(null)`.
+2. Introduce a session start timestamp `rideStartTime: Long = 0L` initialized when `startNavigation()` is called.
+3. Update `stopNavigation(savePrompt: Boolean = true)`:
+   - Check if ride was substantive (e.g. `distanceRiddenKm >= 0.05` or `timeElapsedSeconds >= 20`) to avoid saving accidental 2-second clicks.
+   - If substantive and `savePrompt == true`:
+     - Construct a `RideHistoryEntity` from `telemetry.value` and `activeRoute.value`.
+     - Determine `isEBikeMode`: check whether motor assist was enabled (`activeAssist != AssistLevel.OFF`) or battery telemetry is active. For regular bike mode, set `energyConsumedWh = null` and `batteryDrainPercent = null`.
+     - Assign `completedRideSummary.value = summaryEntity`.
+     - This triggers a Compose dialog: "Pedal Finalizado! Deseja salvar?".
+     - If user clicks "Salvar", call `viewModelScope.launch { repository.saveRide(...) }`.
+     - If user clicks "Descartar", reset `completedRideSummary.value = null`.
+
+### 5.3 Hook 2: Saving the Active Route
+In `RoutePlannerSheet`:
+1. When `activeRoute.value != null`, the user can tap a "Salvar Rota" / Bookmark button.
+2. ViewModel method:
+```kotlin
+fun saveCurrentRoute(customName: String? = null) {
+    val route = activeRoute.value ?: return
+    val wps = _waypoints.value
+    viewModelScope.launch {
+        repository.saveRoute(
+            name = customName ?: route.name,
+            route = route,
+            waypoints = wps
+        )
+    }
+}
+```
+
+### 5.4 Hook 3: Loading a Saved Route
+When the user taps a saved route from the Saved Routes list:
+1. ViewModel method:
+```kotlin
+fun loadSavedRoute(savedRoute: SavedRouteEntity) {
+    val decodedWaypoints = deserializeWaypoints(savedRoute.waypointsJson)
+    _waypoints.value = decodedWaypoints
+    _selectedProfile.value = savedRoute.profile
+    showRoutePlannerSheet.value = true
+    calculateRoute() // Recalculate route for up-to-date traffic/profile
+}
+```
+
+### 5.5 Hook 4: Saving & Loading Favorite Destinations
+1. **In `WaypointSearchDialog`**:
+   - Above the search results or when query is blank, display `savedDestinations` chips ("🏠 Casa", "💼 Trabalho", "⭐ Favoritos").
+   - Tapping a chip immediately invokes `setWaypoint(targetIndex, destination.point, destination.label)` and dismisses the dialog.
+   - On search result items, add a Star/Bookmark icon: tapping it invokes `repository.saveDestination(...)`.
+2. **In Map Tap Dialog (`showMapClickMenuForPoint`)**:
+   - Add a "+ Salvar como Favorito" button to persist the tapped point.
+
+---
+
+## 6. UI Touchpoints & User Experience Flow
+
+```
++-------------------------------------------------------------------------+
+| Top Bar: [ 🔍 Para onde vamos pedalar? ]  [ ⭐ Salvos & Histórico ] [ 🔋 90% ] |
++-------------------------------------------------------------------------+
+                                    |
+                                    v Opens
++-------------------------------------------------------------------------+
+|                  MODAL / SHEET: HISTÓRICO & SALVOS                      |
+|  [ TAB 1: HISTÓRICO ]   [ TAB 2: ROTAS SALVAS ]   [ TAB 3: FAVORITOS ]  |
+|                                                                         |
+|  • 17/09/2026 - Pedal Noturno (Normal Bike)                             |
+|    📏 14.2 km • ⏱️ 38 min • ⚡ 22.4 km/h • ▲ 120m                      |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
+|                                                                         |
+|  • 15/09/2026 - Rota Parque (E-Bike • ECO)                              |
+|    📏 28.5 km • ⏱️ 55 min • ⚡ 31.0 km/h • 🔋 -42 Wh (6.7%)            |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
++-------------------------------------------------------------------------+
+```
+
+### 6.1 UI Entry Points
+1. **Top Bar in `MainActivity.kt`**:
+   - Insert an IconButton or Pill next to Search and Cockpit: `Icons.Default.Bookmark` / `Icons.Default.History` ("Histórico & Salvos").
+   - Controls state `showHistoryDialog: MutableStateFlow<Boolean>`.
+2. **Post-Ride Summary Dialog (`RideSummaryDialog`)**:
+   - Appears immediately upon arriving at the destination or ending navigation.
+   - Shows summary statistics card:
+     - Distance, duration, avg speed, elevation.
+     - Mode badge: "Bicicleta Convencional" vs "E-Bike (Tour/Eco)".
+   - Editable `OutlinedTextField` for custom ride title (prefilled with e.g. "Pedal em [Data]").
+   - Action buttons: "Salvar no Histórico" (EmeraldGreen) vs "Descartar" (Slate700).
+3. **History & Saved Sheet (`RideHistorySheet.kt`)**:
+   - **Tab 1: Histórico de Pedais**:
+     - `LazyColumn` of ride cards sorted by timestamp descending.
+     - Distinguishes standard bike vs e-bike visually.
+     - Swipe-to-delete or delete icon button with `ConfirmDeleteDialog`.
+     - Rename icon button opening `RenameDialog`.
+     - "Repetir no Mapa": loads the polyline on the map for viewing.
+   - **Tab 2: Rotas Salvas**:
+     - List of saved itineraries with profile tags, distance, and duration.
+     - "Navegar Agora": populates waypoints and opens planner.
+     - Rename / Delete options.
+   - **Tab 3: Locais Favoritos**:
+     - List of saved locations (Home, Work, custom).
+     - "Ir para cá": sets destination waypoint.
+4. **Integration into `WaypointSearchDialog.kt`**:
+   - Quick Favorites Row displayed when search query is empty.
+   - Bookmark icon on each search result item to save directly into favorites.
+5. **Integration into `RoutePlannerSheet.kt`**:
+   - A "Salvar Rota" button placed on the active route preview card.
+
+---
+
+## 7. Step-by-Step Implementation Roadmap
+
+| Step | Scope | Description |
+| :--- | :--- | :--- |
+| **Phase 1** | Gradle Setup | Add KSP plugin to root and app `build.gradle.kts`, add `androidx.room` runtime, ktx, and compiler dependencies. |
+| **Phase 2** | Local Data Layer | Implement `RideHistoryEntity`, `SavedRouteEntity`, `SavedDestinationEntity`, Room type converters, DAOs, and `AppDatabase`. |
+| **Phase 3** | Repository Layer | Create `BikeRepository` interface and `BikeRepositoryImpl` managing coroutines on `Dispatchers.IO`. |
+| **Phase 4** | ViewModel Hooks | Inject repository into `BikeMapViewModel`. Wire navigation completion to `completedRideSummary`, add save/load/rename/delete methods. |
+| **Phase 5** | UI Components | Create `RideHistorySheet`, `RideSummaryDialog`, `RenameDialog`, and `ConfirmDeleteDialog`. |
+| **Phase 6** | Search & Planner UI | Integrate favorite destinations row into `WaypointSearchDialog` and "Salvar Rota" into `RoutePlannerSheet`. |
+| **Phase 7** | Verification | Test normal bike rides (no battery data saved), e-bike rides (battery data saved), database migrations, route loading, and deletion. |
+
+---
+
+## 8. Verification & Edge Cases
+
+1. **Normal Bike Mode Integrity**:
+   - Verify that rides performed with regular bike settings have `isEBikeMode = false` and `energyConsumedWh = null`, ensuring the UI cleanly hides battery cards.
+2. **Zero-Distance / Accidental Clicks**:
+   - Guard `completedRideSummary` against short aborts (< 50 meters or < 15 seconds) so database is not polluted.
+3. **Database Versioning & Migration**:
+   - Initial version `version = 1`. If schema evolves, specify clean Room migrations or `fallbackToDestructiveMigration()` during development.
+4. **Polyline Compression**:
+   - Store polylines as Google Polyline Algorithm encoded strings (or serialized coordinate JSON) to avoid large payload overhead in SQLite.
