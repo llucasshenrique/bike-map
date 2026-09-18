@@ -1,370 +1,429 @@
-# Implementation Plan: Real Elevation & Grade Engine for E-Bike / Normal Bike Router
+# Implementation Plan: Ride History & Saved/Favorite Routes Persistence
 
-## 1. Executive Summary & Problem Diagnosis
+## 1. Executive Summary & Architecture Philosophy
 
-### 1.1 Current Implementation Analysis
-In the current codebase ([`GraphRouterService.kt`](app/src/main/kotlin/com/ebike/router/service/GraphRouterService.kt)), elevation and road gradients are entirely synthetic:
-- **Hardcoded Base Elevation**: All route points default to an arbitrary 20.0 meters (`GeoPoint(lat, lng, 20.0)` in line 104 and line 146).
-- **Synthetic Sinusoidal Grade**: In line 150 of `GraphRouterService.kt`:
-  ```kotlin
-  val stepGrade = ((sin(stepIdx * 1.4 + routeIndex) * (if (profile == RoutingProfile.TURBO) 4.5 else 2.8) * slopeMultiplier) * 10).roundToInt() / 10.0
-  val stepEleDiff = ((stepDist * stepGrade) / 100.0).roundToInt()
-  ```
-- **Artificial Route Differentiation**: Line 127 injects an artificial `slopeMultiplier`:
-  ```kotlin
-  val slopeMultiplier = if (routeIndex == 0) 1.0 else if (routeIndex == 1) 0.6 else 1.3
-  ```
-  Route index 1 is artificially multiplied by `0.6` to simulate less elevation, while route index 2 is multiplied by `1.3`.
-- **Misleading Route Alternative Claims**: Lines 221–230 statically label route alternatives based on their array index:
-  ```kotlin
-  val routeTitles = listOf(
-      "Rota Mais Rápida$viaText",
-      "Caminho Mais Plano (Eco)$viaText",
-      "Ciclovia Cênica$viaText"
-  )
-  ```
-  Route 1 is unconditionally declared *"Caminho Mais Plano (Eco)"* even though OSRM returns routes prioritized by travel weight/time, meaning alternative 1 could easily have significantly more climbing than alternative 0 in real topography.
+The application (`com.ebike.router`) is an Android Kotlin/Jetpack Compose navigation and routing app. Its primary architecture philosophy is **normal-bike-first**, featuring an **opt-in e-bike mode** (with battery drain modeling, assist level scaling, and motor wattage physics).
 
-### 1.2 Downstream Ripple Effects in the App
-The fake elevation data corrupts multiple critical subsystems:
-1. **Physical Energy & Battery Modeling ([`EBikePhysicsEngine.kt`](app/src/main/kotlin/com/ebike/router/physics/EBikePhysicsEngine.kt))**:
-   - Computes gravitational resistance: $F_{\text{gravity}} = m \cdot g \cdot \sin(\theta)$ where $\theta = \arctan(\text{gradePercent} / 100.0)$.
-   - Mechanical power, electrical motor demand (Watts), rider leg effort (Watts), and battery depletion (Wh) are distorted by periodic sine oscillations rather than actual road topography.
-   - Regenerative braking is falsely triggered when the sine wave happens to dip below `-3.0%`.
-2. **Elevation Profile Chart ([`ElevationProfileChart.kt`](app/src/main/kotlin/com/ebike/router/ui/components/ElevationProfileChart.kt))**:
-   - Displays a synthetic undulating curve and inaccurate summary badges (`▲ elevationGainM`, `▼ elevationLossM`, `Máx: maxGradePercent%`).
-   - For regular cyclists ("normal-bike-first") and e-bike riders planning battery usage, an inaccurate elevation profile destroys trust.
-3. **Map Polyline Grade Coloring ([`OsmdroidMapView.kt`](app/src/main/kotlin/com/ebike/router/ui/components/OsmdroidMapView.kt))**:
-   - Segments are rendered in Cyan (`< 0%`), Emerald (`0–3%`), Amber (`3–7%`), and Red (`> 7%`) purely based on sine values, misleading the rider about upcoming steep hills.
-4. **Turn-by-Turn & Audio Guidance ([`AudioGuidanceService.kt`](app/src/main/kotlin/com/ebike/router/service/AudioGuidanceService.kt), [`NavigationHud.kt`](app/src/main/kotlin/com/ebike/router/ui/components/NavigationHud.kt))**:
-   - `mapManeuver` injects `ManeuverType.CLIMB_AHEAD` when `stepGrade >= 6.0`, prompting the voice guide to announce *"Subida íngreme à frente! Aumente o nível de assistência"* at flat intersections or false locations.
+Currently, the app has **zero local persistence** — no Room, DataStore, or SharedPreferences. If the user closes the app or finishes a ride, all route computations, waypoints, and ride telemetry disappear immediately.
+
+This document outlines a production-ready implementation plan to introduce local database persistence using **Jetpack Room** and **Kotlin Coroutines / Flow**, covering:
+1. **Ride History Persistence**: Logging completed rides (distance, duration, avg/max speed, elevation gain/loss, polyline path, and optional e-bike metrics).
+2. **Saved / Favorite Routes**: Storing multi-stop itineraries with profile preference, waypoints, and polyline previews.
+3. **Saved / Favorite Destinations**: Storing frequent places (Home, Work, Trails) for 1-tap waypoint selection in search dialogs.
 
 ---
 
-## 2. Evaluation of Real Elevation Data Sources
+## 2. Dependencies & Build Configuration (`build.gradle.kts`)
 
-| Criteria | OSRM Public Annotations | Open-Elevation Public API (`api.open-elevation.com`) | Self-Hosted Open-Elevation / OpenTopoData | Bundled SRTM / HGT Tiles (On-Device DEM) | High-Reliability Public API (Open-Meteo DEM) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Availability** | ❌ None on public servers | ⚠️ Available but unstable | ✅ High (self-controlled) | ✅ 100% Offline | ✅ 99.9% Uptime |
-| **Observed Latency** | N/A (no elevation returned) | ❌ 15,000 – 25,000 ms (measured) | ✅ 20 – 60 ms | ⚡ < 5 ms (in-memory/disk) | ⚡ 100 – 250 ms |
-| **Payload Limits** | N/A | Variable (~100 pts POST) | Up to 1,000 pts POST | Unlimited (local seek) | Up to 500 pts GET/POST |
-| **Offline Support** | ❌ No | ❌ No | ❌ No | ✅ Complete (no network) | ❌ No |
-| **Storage / App Size Cost**| 0 MB | 0 MB | 0 MB | ⚠️ ~2.9 MB per 1°x1° tile (SRTM3) or ~26 MB (SRTM1) | 0 MB |
-| **Operational Overhead** | None | None | ⚠️ VPS maintenance ($5/mo) | File packaging & tile indexing | Free tier (up to 10k calls/day) |
+### 2.1 Root `build.gradle.kts`
+Add the Kotlin Symbol Processing (KSP) plugin matching Kotlin `2.0.21`:
+```kotlin
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+}
+```
 
-### Detailed Assessment by Source
+### 2.2 `app/build.gradle.kts`
+Apply the KSP plugin and add Room dependencies:
+```kotlin
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
 
-#### 1. OSRM Annotations
-- **Findings from Live Query Inspection**:
-  Calling `https://routing.openstreetmap.de/routed-bike/route/v1/driving/...?...annotations=true` returns:
-  `annotations: ["datasources", "distance", "duration", "metadata", "nodes", "speed", "weight"]`.
-- **Verdict**: The public OSRM bike instances **do not index raster elevation**. They cannot provide elevation or gradient data without rebuilding custom OSRM graphs using custom Lua extraction profiles and raster elevation files. This is not viable while using public OSM endpoints.
+dependencies {
+    // Existing:
+    // ...
+    // implementation("com.google.code.gson:gson:2.11.0")
 
-#### 2. Open-Elevation Public API (`api.open-elevation.com`)
-- **Findings from Live Request Inspection**:
-  Calling `POST https://api.open-elevation.com/api/v1/lookup` with `{"locations": [{"latitude": -23.5505, "longitude": -46.6333}]}` returned elevation `766.0m`, but took **~20 seconds** for a single point.
-- **Verdict**: The public server is severely resource-constrained, subject to community throttling, and exhibits frequent downtime. Relying on it directly in the mobile app would cause route calculation to hang for 30–60 seconds, resulting in unacceptable UX.
-
-#### 3. Bundled SRTM / HGT Tiles (On-Device Offline DEM)
-- **Technical Anatomy**:
-  SRTM HGT files are raw 16-bit big-endian signed integers representing meters above sea level:
-  - **SRTM3 (3 arc-second ~90m resolution)**: $1201 \times 1201$ samples = `2,884,802` bytes (~2.88 MB per 1°x1° tile).
-  - **SRTM1 (1 arc-second ~30m resolution)**: $3601 \times 3601$ samples = `25,934,402` bytes (~25.9 MB per 1°x1° tile).
-- **Feasibility for Mobile**:
-  - Global pre-bundling is impossible (hundreds of gigabytes).
-  - Pre-bundling a designated metropolitan area (e.g. 2 tiles for Greater São Paulo: `S24W047.hgt` and `S24W046.hgt` = ~5.7 MB total in SRTM3) in Android `assets/dem/` is lightweight, robust, and requires zero network traffic.
-  - An on-demand background downloader can download tiles into `context.filesDir/srtm/` when the user routes in other regions.
-- **Verdict**: Optimal for high-speed offline operation, instant response (< 5ms), and zero external API dependencies.
-
-#### 4. Self-Hosted Open-Elevation / OpenTopoData or Open-Meteo DEM API
-- **OpenTopoData / Open-Elevation Self-Hosted**:
-  Deploying a containerized OpenTopoData or Open-Elevation service with SRTM 30m / Copernicus 30m dataset provides reliable <50ms responses.
-- **Open-Meteo Elevation API (`api.open-meteo.com/v1/elevation`)**:
-  Uses Copernicus 30m/90m DEM, completely free for non-commercial mobile apps (up to 10,000 calls/day), sub-200ms latency, and accepts comma-separated lists of lat/long coordinates.
-- **Verdict**: Ideal as the online elevation provider tier.
-
-### Recommended Elevation Architecture: Three-Tier Hybrid Provider
-To guarantee reliability, fast UI response, and offline functionality:
-1. **Tier 1 (Persistent Cache)**: On-device SQLite/Room database indexing previously queried coordinates via spatial hashing.
-2. **Tier 2 (Offline DEM Engine)**: Local HGT file reader (`SrtmHgtReader`) reading bundled regional tiles or cached HGT tiles. If the coordinates fall within available local tiles, resolve elevations offline in 1–3 ms.
-3. **Tier 3 (Remote Elevation Service)**: Resilient HTTP client querying an elevation API (Self-hosted Open-Elevation/OpenTopoData or Open-Meteo as high-uptime endpoint) with automatic fallback.
-
-```mermaid
-flowchart TD
-    A["Route Coordinates from OSRM"] --> B["Equidistant Downsampler (every 30-40m)"]
-    B --> C["Spatial Key Quantization (GeoHash / Grid)"]
-    C --> D{"Tier 1: On-Device Cache Hit?"}
-    D -- Yes --> E["Assemble Elevation Profile"]
-    D -- No --> F{"Tier 2: Local SRTM Tile Available?"}
-    F -- Yes --> G["Read Direct from .hgt File (<5ms)"]
-    G --> H["Store in Local Cache"]
-    H --> E
-    F -- No --> I["Tier 3: Remote Elevation API (Batched HTTP)"]
-    I --> J["Parse Elevations & Store in Local Cache"]
-    J --> E
-    E --> K["Savitzky-Golay / Moving Average Smoothing"]
-    K --> L["Grade & Ascent Calculation (Threshold Hysteresis)"]
-    L --> M["Update RouteResult, Segments & Physics Engine"]
+    // Room Persistence
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+}
 ```
 
 ---
 
-## 3. Request Batching & Spatial Sampling Strategy
+## 3. Data Model & Room Entities
 
-### 3.1 The Sampling Problem
-An OSRM bike route geometry typically contains 1,000 to 3,000 raw polyline vertices for a 15 km journey.
-- Querying DEM for every individual vertex creates massive payloads, wastes mobile data, and introduces latency.
-- DEM data has a native resolution of ~30m (SRTM1/Copernicus) or ~90m (SRTM3). Sampling points closer than 25m introduces high-frequency GPS noise without adding topographical detail.
+To respect the **normal-bike-first** principle, all e-bike-specific telemetry fields (such as `energyConsumedWh`, `batteryDrainPercent`, and `assistLevel`) are **nullable**. When a rider completes a regular bike ride, e-bike metrics are `null`, avoiding artificial zero-battery entries.
 
-### 3.2 Sampling Algorithm
-1. **Anchor Point Preservation**:
-   - Retain the exact starting coordinate (`points.first()`) and destination coordinate (`points.last()`).
-   - Retain every OSRM step maneuver boundary point (`stepCoords.first()` and `stepCoords.last()`) so turn instructions align with exact ground elevations.
-2. **Equidistant Polyline Downsampling (30m – 50m intervals)**:
-   - Walk the route coordinates cumulatively.
-   - Interpolate a sample point every 35 meters along the polyline.
-   - For a 10 km route: $\approx 285$ sampled elevation points.
-   - For a 25 km route: $\approx 714$ sampled elevation points.
-3. **Multi-Alternative Deduplication**:
-   - When OSRM returns 2 or 3 route alternatives, they frequently share the first 1–3 km or final 1–3 km.
-   - Deduplicate coordinates across all alternatives before fetching to prevent redundant network requests.
+### 3.1 Entity: `RideHistoryEntity`
+Stores completed or recorded rides.
 
-### 3.3 Batching & Concurrency Parameters
-- **Batch Chunk Size**: 100 coordinates per HTTP request.
-  - A 10 km route (~285 points) requires only 3 HTTP requests.
-- **Asynchronous Execution**:
-  - Dispatch requests concurrently via Kotlin Coroutines (`async`/`awaitAll` on `Dispatchers.IO`).
-  - Constrain concurrency with a `Semaphore(permits = 3)` to avoid saturating mobile radio or hitting connection timeouts.
-- **Timeout & Retry Policy**:
-  - OkHttpClient timeout: 4s connect, 5s read.
-  - 1 exponential backoff retry before falling back to linear elevation interpolation between known points.
+```kotlin
+package com.ebike.router.data.local.entity
 
----
+import androidx.room.Entity
+import androidx.room.PrimaryKey
 
-## 4. Elevation Smoothing & Realistic Grade Calculation
-
-### 4.1 The DEM Noise Dilemma
-Raw DEM data has a typical vertical absolute error of $\pm 2$ to $5$ meters.
-If two sampled points are 30 meters apart:
-- Point $A$: True ground = 700.0m, DEM returns 702.0m (+2m error).
-- Point $B$: True ground = 700.0m, DEM returns 698.0m (-2m error).
-- Naive grade calculation: $\frac{698.0 - 702.0}{30} \times 100 = -13.3\%$ slope on an actually flat road!
-- Naive cumulative ascent: Every micro-ripple adds 2–4m of false elevation gain, causing a flat 10 km ride to report 300m+ of climbing.
-
-### 4.2 Mathematical Processing Pipeline
-
-#### Step 1: Elevation Smoothing (Low-Pass Filter)
-Apply a 5-point moving window or a Gaussian weighted smoothing across the sampled profile:
-$$E_{\text{smooth}}[i] = 0.1 \cdot E[i-2] + 0.2 \cdot E[i-1] + 0.4 \cdot E[i] + 0.2 \cdot E[i+1] + 0.1 \cdot E[i+2]$$
-
-#### Step 2: Hysteresis Threshold for Elevation Gain/Loss
-To prevent noise accumulation, only accumulate positive elevation gain when the vertical delta exceeds a threshold ($H_{\text{threshold}} = 1.5\text{m}$):
-- Maintain a local minimum reference point.
-- Only increment `eleGainM` when elevation exceeds reference by $\ge 1.5\text{m}$.
-- Similarly, only increment `eleLossM` when elevation drops below reference by $\ge 1.5\text{m}$.
-
-#### Step 3: Gradient Clamping & Smoothing
-Compute road grade across each segment:
-$$\text{gradePercent} = \left( \frac{E_{\text{smooth}}[i] - E_{\text{smooth}}[i-1]}{\text{distanceMeters}} \right) \times 100.0$$
-- Clamp to physical road limits for urban cycling: $[-25.0\%, +25.0\%]$.
-- Round to 1 decimal place (`(grade * 10).roundToInt() / 10.0`).
-
----
-
-## 5. Caching Strategy (On-Device Two-Tier Cache)
-
-Topographical elevation is static (it does not change over time). Once an area's elevations are fetched, they can be cached indefinitely.
-
-### 5.1 Spatial Key Quantization
-Mobile GPS coordinates vary continuously at the 5th and 6th decimal digits. A raw `(lat, lng)` key has a 0% cache hit rate.
-- **Quantization Formula**:
-  Round coordinates to 4 decimal places (~11 meters resolution at the equator):
-  $$\text{latKey} = \text{round}(\text{lat} \times 10000) / 10000.0$$
-  $$\text{lngKey} = \text{round}(\text{lng} \times 10000) / 10000.0$$
-- **64-bit Spatial Key**: Pack quantized coordinates into a single `Long`:
-  $$\text{spatialId} = \left( (\text{latKey} \times 10000).\text{toLong}() \ll 32 \right) \lor \left( (\text{lngKey} \times 10000).\text{toLong}() \ \& \ \text{0xFFFFFFFFL} \right)$$
-
-### 5.2 Two-Tier Cache Hierarchy
-1. **L1: In-Memory LRU Cache**:
-   - Android `androidx.collection.LruCache<Long, Float>(maxSize = 20_000)` (~160 KB memory).
-   - Serves immediate drag-and-drop waypoint adjustments and alternative route recalculations in < 1ms.
-2. **L2: Persistent SQLite / Room Database**:
-   - Table: `elevation_cache`:
-     ```sql
-     CREATE TABLE elevation_cache (
-         spatial_key INTEGER PRIMARY KEY,
-         latitude REAL NOT NULL,
-         longitude REAL NOT NULL,
-         elevation_m REAL NOT NULL,
-         created_at INTEGER NOT NULL
-     );
-     CREATE INDEX idx_elevation_spatial ON elevation_cache(spatial_key);
-     ```
-   - Capacity: Up to 100,000 records (~4.5 MB on disk).
-   - Eviction: LRU or prune records older than 180 days when database exceeds 10 MB.
-
----
-
-## 6. Overhaul of Route Alternative Labeling & "Flattest Route" Claims
-
-### 6.1 Current Flaw
-Currently, `GraphRouterService.kt` assigns fixed titles based purely on list index:
-- Index 0: `"Rota Mais Rápida"`
-- Index 1: `"Caminho Mais Plano (Eco)"` (using fake `slopeMultiplier = 0.6`)
-- Index 2: `"Ciclovia Cênica"` (using fake `slopeMultiplier = 1.3`)
-
-In reality, OSRM does not sort routes by slope; alternative 1 is simply the second fastest route found by the graph search. In hilly terrain, alternative 1 could easily ascend 180m while alternative 0 ascends 95m. Displaying *"Caminho Mais Plano"* on a hillier route is factually misleading and damages cycling safety and battery range estimation.
-
-### 6.2 Dynamic Multi-Attribute Route Classifier
-With real elevation data available, routes must be classified **dynamically by comparing actual computed physical metrics** across all generated alternatives:
-
-```mermaid
-flowchart TD
-    R["All Parsed Routes with Real Elevation"] --> M["Calculate Metrics per Route:
-    - totalDurationSeconds
-    - elevationGainM
-    - maxGradePercent
-    - totalEnergyWh
-    - totalDistanceMeters"]
-    M --> C1["Find Fastest: min(totalDurationSeconds)"]
-    M --> C2["Find Flattest: min(elevationGainM)"]
-    M --> C3["Find Most Efficient: min(totalEnergyWh)"]
-    M --> C4["Find Shortest: min(totalDistanceMeters)"]
-    C1 & C2 & C3 & C4 --> CL["Dynamic Label Assignment & Badge Generator"]
+@Entity(tableName = "ride_history")
+data class RideHistoryEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val title: String,                          // e.g. "Pedal Matinal", "Parque Ibirapuera", or custom name
+    val timestampMillis: Long,                  // Start timestamp (System.currentTimeMillis())
+    val distanceMeters: Int,                    // Total distance traveled
+    val durationSeconds: Int,                   // Total elapsed active ride time
+    val avgSpeedKmh: Double,                    // Calculated average speed
+    val maxSpeedKmh: Double,                    // Peak speed recorded
+    val elevationGainM: Int,                    // Total meters climbed
+    val elevationLossM: Int,                    // Total meters descended
+    val routePolyline: String,                  // JSON array or Encoded Polyline (GeoPoint list)
+    val startAddress: String? = null,           // Human-readable origin label
+    val endAddress: String? = null,             // Human-readable destination label
+    
+    // Normal-bike-first vs E-bike opt-in attributes:
+    val isEBikeMode: Boolean = false,           // False for regular acoustic bikes, true if e-bike mode was used
+    val assistLevel: String? = null,            // AssistLevel name (OFF, ECO, TOUR, SPORT, TURBO) or null
+    val energyConsumedWh: Double? = null,       // Wh consumed during ride (null if standard bike)
+    val batteryDrainPercent: Double? = null     // Percentage drain (null if standard bike)
+)
 ```
 
-### 6.3 Classification Rules
+### 3.2 Entity: `SavedRouteEntity`
+Stores complete multi-waypoint itineraries that users want to repeat.
 
-| Category | Qualification Criteria | Title Format | Summary Format |
-| :--- | :--- | :--- | :--- |
-| **Fastest Route** | Lowest `totalDurationSeconds` | `"Mais Rápida via {Street}"` | `"Menor tempo de trajeto ({X} min)"` |
-| **Flattest Route** | Lowest `elevationGainM`, where gain is at least 15% lower than the fastest route | `"Mais Plana (Eco) via {Street}"` | `"▲ {X}m de subida ({P}% menos subidas)"` |
-| **Lowest Energy** | Lowest `totalEnergyWh` calculated by `EBikePhysicsEngine` | `"Mais Econômica via {Street}"` | `"Consome apenas {X} Wh de bateria"` |
-| **Shortest Distance**| Lowest `totalDistanceMeters` | `"Mais Curta via {Street}"` | `"Trajeto mais direto ({X} km)"` |
-| **Balanced Alternative** | Elevation and time within 10% of primary | `"Alternativa via {Street}"` | `"Boa alternativa com tráfego calmo"` |
+```kotlin
+package com.ebike.router.data.local.entity
 
-#### Handling Near-Identical Elevation
-If two routes have elevation gain differences under 10% (e.g. 52m vs 55m):
-- Do **not** claim one is the "Caminho Mais Plano".
-- Instead, label both based on street names (e.g., `"Via Av. Brigadeiro Luis Antonio"` vs `"Via Rua da Consolação"`).
-- Only award the `"Mais Plana"` badge if the climbing reduction is noticeable to a cyclist (e.g., $\Delta \ge 20\text{m}$ and $\ge 15\%$).
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+import com.ebike.router.model.RoutingProfile
+
+@Entity(tableName = "saved_routes")
+data class SavedRouteEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val name: String,                           // e.g. "Caminho do Trabalho (Ciclovia)"
+    val profile: RoutingProfile,                // EFFICIENT, TURBO, SCENIC, SAFE
+    val waypointsJson: String,                  // Serialized List<RouteWaypoint>
+    val polylineJson: String,                   // Serialized List<GeoPoint> for immediate rendering
+    val totalDistanceMeters: Int,
+    val totalDurationSeconds: Int,
+    val elevationGainM: Int,
+    val isFavorite: Boolean = true,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
+
+### 3.3 Entity: `SavedDestinationEntity`
+Stores pinned destination points for rapid reuse in the search dialog and main map.
+
+```kotlin
+package com.ebike.router.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+enum class DestinationCategory {
+    HOME, WORK, FAVORITE, TRAIL, POI
+}
+
+@Entity(tableName = "saved_destinations")
+data class SavedDestinationEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val label: String,                          // e.g. "Casa", "Trabalho", "Ciclovia Pinheiros"
+    val subText: String,                        // Address or descriptive text
+    val lat: Double,
+    val lng: Double,
+    val ele: Double = 20.0,
+    val category: DestinationCategory = DestinationCategory.FAVORITE,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
+
+### 3.4 Room Type Converters
+Using the existing Gson library (`com.google.code.gson:gson:2.11.0`):
+- `RoutingProfile` <-> `String`
+- `DestinationCategory` <-> `String`
+- `List<GeoPoint>` <-> `String` (JSON or Google Polyline Algorithm)
+- `List<RouteWaypoint>` <-> `String` (JSON)
 
 ---
 
-## 7. Integration Plan & File Changes
+## 4. DAO & Repository Layer Design
 
+### 4.1 DAOs (`RideHistoryDao`, `SavedRouteDao`, `SavedDestinationDao`)
+
+```kotlin
+package com.ebike.router.data.local.dao
+
+import androidx.room.*
+import com.ebike.router.data.local.entity.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface RideHistoryDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRide(ride: RideHistoryEntity): Long
+
+    @Query("UPDATE ride_history SET title = :newTitle WHERE id = :id")
+    suspend fun renameRide(id: Long, newTitle: String)
+
+    @Delete
+    suspend fun deleteRide(ride: RideHistoryEntity)
+
+    @Query("DELETE FROM ride_history WHERE id = :id")
+    suspend fun deleteRideById(id: Long)
+
+    @Query("SELECT * FROM ride_history ORDER BY timestampMillis DESC")
+    fun getAllRides(): Flow<List<RideHistoryEntity>>
+
+    @Query("SELECT * FROM ride_history WHERE id = :id")
+    suspend fun getRideById(id: Long): RideHistoryEntity?
+}
+
+@Dao
+interface SavedRouteDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRoute(route: SavedRouteEntity): Long
+
+    @Query("UPDATE saved_routes SET name = :newName WHERE id = :id")
+    suspend fun renameRoute(id: Long, newName: String)
+
+    @Query("UPDATE saved_routes SET isFavorite = :isFav WHERE id = :id")
+    suspend fun setFavorite(id: Long, isFav: Boolean)
+
+    @Query("DELETE FROM saved_routes WHERE id = :id")
+    suspend fun deleteRouteById(id: Long)
+
+    @Query("SELECT * FROM saved_routes ORDER BY createdAtMillis DESC")
+    fun getAllSavedRoutes(): Flow<List<SavedRouteEntity>>
+}
+
+@Dao
+interface SavedDestinationDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDestination(destination: SavedDestinationEntity): Long
+
+    @Query("UPDATE saved_destinations SET label = :newLabel WHERE id = :id")
+    suspend fun renameDestination(id: Long, newLabel: String)
+
+    @Query("DELETE FROM saved_destinations WHERE id = :id")
+    suspend fun deleteDestinationById(id: Long)
+
+    @Query("SELECT * FROM saved_destinations ORDER BY createdAtMillis DESC")
+    fun getAllDestinations(): Flow<List<SavedDestinationEntity>>
+}
 ```
-app/src/main/kotlin/com/ebike/router/
-├── data/
-│   ├── local/
-│   │   ├── ElevationDatabase.kt            [NEW] Room DB definition
-│   │   ├── ElevationDao.kt                 [NEW] DAO for spatial queries
-│   │   └── ElevationEntity.kt              [NEW] Entity for cached elevation points
-│   └── dem/
-│       ├── SrtmHgtReader.kt                [NEW] Memory-mapped binary .hgt file reader
-│       └── SrtmTileManager.kt              [NEW] Bundled asset & downloaded tile manager
-├── service/
-│   ├── elevation/
-│   │   ├── ElevationProvider.kt            [NEW] Interface: getElevations(points): List<Double>
-│   │   ├── SrtmElevationProvider.kt        [NEW] Tier 2 local HGT provider
-│   │   ├── RemoteElevationProvider.kt      [NEW] Tier 3 Open-Meteo/Open-Elevation provider
-│   │   ├── CompositeElevationProvider.kt   [NEW] Orchestrates Tier 1 -> Tier 2 -> Tier 3
-│   │   └── ElevationSmoother.kt            [NEW] 5-point low-pass filter & hysteresis gain/loss
-│   └── GraphRouterService.kt               [REF] Integrate real elevation & dynamic labeling
-└── ui/
-    └── components/
-        └── RoutePlannerSheet.kt            [REF] Display dynamic badges (e.g. "▲ -30% subidas")
+
+### 4.2 Room Database (`AppDatabase`)
+```kotlin
+@Database(
+    entities = [
+        RideHistoryEntity::class,
+        SavedRouteEntity::class,
+        SavedDestinationEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(RoomConverters::class)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun rideHistoryDao(): RideHistoryDao
+    abstract fun savedRouteDao(): SavedRouteDao
+    abstract fun savedDestinationDao(): SavedDestinationDao
+
+    companion object {
+        @Volatile private var INSTANCE: AppDatabase? = null
+        fun getInstance(context: Context): AppDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "bike_router.db"
+                ).build().also { INSTANCE = it }
+            }
+    }
+}
 ```
 
-### Detailed Modifications to Existing Files
-
-#### 1. [`GraphRouterService.kt`](app/src/main/kotlin/com/ebike/router/service/GraphRouterService.kt)
-- **Remove Fake Logic**:
-  - Remove line 127 (`slopeMultiplier = if (routeIndex == 0) ...`).
-  - Remove line 150 (`val stepGrade = ((sin(stepIdx * 1.4 + routeIndex) ...))`).
-  - Remove lines 221–230 (static `routeTitles` and `routeSummaries`).
-- **Inject Elevation Workflow**:
-  1. Parse coordinates from OSRM geometry.
-  2. Downsample and deduplicate across all alternatives.
-  3. Query `CompositeElevationProvider.getElevations(sampledPoints)`.
-  4. Pass raw elevations through `ElevationSmoother` to compute smooth profiles, `elevationGainM`, `elevationLossM`, and step `gradePercent`.
-  5. Recalculate each segment's energy via `EBikePhysicsEngine.calculateSegmentEnergy(dist, realGrade, speed)`.
-  6. Execute `RouteClassifier.classifyRoutes(parsedRoutes)` to assign truthful names and summaries.
-
-#### 2. [`ElevationProfileChart.kt`](app/src/main/kotlin/com/ebike/router/ui/components/ElevationProfileChart.kt)
-- Already expects `points: List<ElevationPoint>`, `elevationGainM`, `elevationLossM`, and `maxGradePercent`.
-- Because real elevations vary from 700m to 850m (in elevated cities like São Paulo), verify that chart normalization `normEle = ((pt.elevationM - minEle) / eleRange)` scales correctly with realistic baseline values (existing code already uses relative range `maxEle - minEle`, which adapts properly).
-
-#### 3. [`OsmdroidMapView.kt`](app/src/main/kotlin/com/ebike/router/ui/components/OsmdroidMapView.kt)
-- Grade threshold coloring is currently applied per `RouteSegment`.
-- With real elevation, long straight steps (e.g., a 1.2 km avenue) can transition from flat to steep climb mid-step.
-- Plan enhancement: Subdivide `RouteSegment` into 50–100m sub-segments when rendering the polyline so color transitions match the real hill slope.
+### 4.3 Repository Interface & Implementation (`BikeRepository`)
+A unified repository decoupling Room entities from UI ViewModels:
+- `val allRides: Flow<List<RideHistoryEntity>>`
+- `val savedRoutes: Flow<List<SavedRouteEntity>>`
+- `val savedDestinations: Flow<List<SavedDestinationEntity>>`
+- `suspend fun saveRide(ride: RideHistoryEntity): Long`
+- `suspend fun renameRide(id: Long, title: String)`
+- `suspend fun deleteRide(id: Long)`
+- `suspend fun saveRoute(name: String, route: RouteResult, waypoints: List<RouteWaypoint>): Long`
+- `suspend fun deleteRoute(id: Long)`
+- `suspend fun renameRoute(id: Long, newName: String)`
+- `suspend fun saveDestination(label: String, point: GeoPoint, address: String, category: DestinationCategory)`
+- `suspend fun deleteDestination(id: Long)`
 
 ---
 
-## 8. Verification & Testing Strategy
+## 5. ViewModel Integration & State Machine Hooks
 
-### 8.1 Unit Testing (`app/src/test/kotlin/com/ebike/router/`)
-- **`SrtmHgtReaderTest`**:
-  - Verify binary coordinate lookup against known benchmarks (e.g. Pico do Jaraguá, SP: ~1,135m; Praça da Sé, SP: ~760m).
-  - Verify edge cases (negative elevations below sea level, tile boundaries at integer degrees).
-- **`ElevationSmootherTest`**:
-  - Feed synthetic noisy data ($\pm 5\text{m}$ random jitter on a flat 0% road) and verify that cumulative elevation gain does not explode.
-  - Test steep mountain pass profile and verify that `maxGradePercent` matches mathematical slope without clipping artifacts.
-- **`RouteClassifierTest`**:
-  - Given Route A (10km, 20min, 120m climb) and Route B (11km, 23min, 40m climb):
-    - Verify Route A is classified as *"Mais Rápida"*.
-    - Verify Route B is classified as *"Mais Plana"*.
-  - Given Route A and Route B with only 3m difference in climbing:
-    - Verify neither is falsely declared "Mais Plana", both using contextual street labels.
+`BikeMapViewModel` is the single source of truth for the map UI and navigation state. Below are the precise locations to hook save/load operations:
 
-### 8.2 Real-World Route Validation Benchmarks
-Test route calculations in São Paulo's challenging topography:
-1. **Av. Paulista $\rightarrow$ Vale do Anhangabaú**:
-   - Extreme descent (-80m drop in ~2.5 km, grades reaching -8% to -10%).
-   - Verification: Cyan downhill polyline, regenerative braking activation in `EBikePhysicsEngine`, negative Wh drain.
-2. **Marginal Pinheiros $\rightarrow$ Cidade Universitária (USP)**:
-   - Completely flat riverbank corridor (~0% to 1.5% grade).
-   - Verification: Emerald green polyline, minimal elevation gain ($\le 10\text{m}$), smooth chart profile.
-3. **Sumaré $\rightarrow$ Perdizes (Rua Monte Alegre / Cardoso de Almeida)**:
-   - Punishing short climbs (+14% to +18% grade).
-   - Verification: Amber/Red polyline, `CLIMB_AHEAD` turn instructions triggered, high motor wattage (> 350W) in physics engine.
+### 5.1 Repository Initialization
+In `BikeMapViewModel(application: Application)`:
+```kotlin
+private val database = AppDatabase.getInstance(application)
+val repository: BikeRepository = BikeRepositoryImpl(
+    database.rideHistoryDao(),
+    database.savedRouteDao(),
+    database.savedDestinationDao()
+)
+
+// Expose observable state flows to Compose UI
+val rideHistory = repository.allRides.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedRoutes = repository.savedRoutes.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedDestinations = repository.savedDestinations.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+```
+
+### 5.2 Hook 1: Ride Completion & Auto-Save Prompt
+Currently, in `BikeMapViewModel.kt`:
+- `handleRiderLocationUpdate` checks `if (distToManeuver <= 15)` on the last instruction and calls `stopNavigation()`.
+- `stopNavigation()` immediately sets `_isNavigating.value = false` and cancels `rideTimerJob`, discarding all telemetry.
+
+**Proposed Hook**:
+1. Introduce a state `val completedRideSummary = MutableStateFlow<RideHistoryEntity?>(null)`.
+2. Introduce a session start timestamp `rideStartTime: Long = 0L` initialized when `startNavigation()` is called.
+3. Update `stopNavigation(savePrompt: Boolean = true)`:
+   - Check if ride was substantive (e.g. `distanceRiddenKm >= 0.05` or `timeElapsedSeconds >= 20`) to avoid saving accidental 2-second clicks.
+   - If substantive and `savePrompt == true`:
+     - Construct a `RideHistoryEntity` from `telemetry.value` and `activeRoute.value`.
+     - Determine `isEBikeMode`: check whether motor assist was enabled (`activeAssist != AssistLevel.OFF`) or battery telemetry is active. For regular bike mode, set `energyConsumedWh = null` and `batteryDrainPercent = null`.
+     - Assign `completedRideSummary.value = summaryEntity`.
+     - This triggers a Compose dialog: "Pedal Finalizado! Deseja salvar?".
+     - If user clicks "Salvar", call `viewModelScope.launch { repository.saveRide(...) }`.
+     - If user clicks "Descartar", reset `completedRideSummary.value = null`.
+
+### 5.3 Hook 2: Saving the Active Route
+In `RoutePlannerSheet`:
+1. When `activeRoute.value != null`, the user can tap a "Salvar Rota" / Bookmark button.
+2. ViewModel method:
+```kotlin
+fun saveCurrentRoute(customName: String? = null) {
+    val route = activeRoute.value ?: return
+    val wps = _waypoints.value
+    viewModelScope.launch {
+        repository.saveRoute(
+            name = customName ?: route.name,
+            route = route,
+            waypoints = wps
+        )
+    }
+}
+```
+
+### 5.4 Hook 3: Loading a Saved Route
+When the user taps a saved route from the Saved Routes list:
+1. ViewModel method:
+```kotlin
+fun loadSavedRoute(savedRoute: SavedRouteEntity) {
+    val decodedWaypoints = deserializeWaypoints(savedRoute.waypointsJson)
+    _waypoints.value = decodedWaypoints
+    _selectedProfile.value = savedRoute.profile
+    showRoutePlannerSheet.value = true
+    calculateRoute() // Recalculate route for up-to-date traffic/profile
+}
+```
+
+### 5.5 Hook 4: Saving & Loading Favorite Destinations
+1. **In `WaypointSearchDialog`**:
+   - Above the search results or when query is blank, display `savedDestinations` chips ("🏠 Casa", "💼 Trabalho", "⭐ Favoritos").
+   - Tapping a chip immediately invokes `setWaypoint(targetIndex, destination.point, destination.label)` and dismisses the dialog.
+   - On search result items, add a Star/Bookmark icon: tapping it invokes `repository.saveDestination(...)`.
+2. **In Map Tap Dialog (`showMapClickMenuForPoint`)**:
+   - Add a "+ Salvar como Favorito" button to persist the tapped point.
 
 ---
 
-## 9. Phased Implementation Roadmap
+## 6. UI Touchpoints & User Experience Flow
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ Phase 1: Local Cache & Data Infrastructure                   │
-│ • Add Room SQLite dependency                                 │
-│ • Create elevation_cache table & spatial quantization key    │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-┌──────────────────────────────▼───────────────────────────────┐
-│ Phase 2: Offline DEM & Remote Elevation Providers            │
-│ • Implement SrtmHgtReader (binary 16-bit Big-Endian parser)  │
-│ • Bundle initial metro tile (assets/dem/S24W047.hgt)         │
-│ • Implement RemoteElevationProvider (Open-Meteo / Fallback)  │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-┌──────────────────────────────▼───────────────────────────────┐
-│ Phase 3: Route Downsampling & Smoothing Engine               │
-│ • Implement equidistant polyline sampler (35m interval)      │
-│ • Implement 5-point moving average & hysteresis filter       │
-│ • Batch coordinate requests into chunks of 100               │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-┌──────────────────────────────▼───────────────────────────────┐
-│ Phase 4: GraphRouterService Refactor & Dynamic Classifier    │
-│ • Remove fake sin() calculation from GraphRouterService.kt   │
-│ • Integrate real grades into EBikePhysicsEngine              │
-│ • Implement multi-metric dynamic route classifier            │
-└──────────────────────────────┬───────────────────────────────┘
-                               │
-┌──────────────────────────────▼───────────────────────────────┐
-│ Phase 5: Verification & UI Tuning                            │
-│ • Validate on physical topography benchmarks                 │
-│ • Verify ElevationProfileChart rendering & grade colors      │
-└──────────────────────────────────────────────────────────────┘
++-------------------------------------------------------------------------+
+| Top Bar: [ 🔍 Para onde vamos pedalar? ]  [ ⭐ Salvos & Histórico ] [ 🔋 90% ] |
++-------------------------------------------------------------------------+
+                                    |
+                                    v Opens
++-------------------------------------------------------------------------+
+|                  MODAL / SHEET: HISTÓRICO & SALVOS                      |
+|  [ TAB 1: HISTÓRICO ]   [ TAB 2: ROTAS SALVAS ]   [ TAB 3: FAVORITOS ]  |
+|                                                                         |
+|  • 17/09/2026 - Pedal Noturno (Normal Bike)                             |
+|    📏 14.2 km • ⏱️ 38 min • ⚡ 22.4 km/h • ▲ 120m                      |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
+|                                                                         |
+|  • 15/09/2026 - Rota Parque (E-Bike • ECO)                              |
+|    📏 28.5 km • ⏱️ 55 min • ⚡ 31.0 km/h • 🔋 -42 Wh (6.7%)            |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
++-------------------------------------------------------------------------+
 ```
+
+### 6.1 UI Entry Points
+1. **Top Bar in `MainActivity.kt`**:
+   - Insert an IconButton or Pill next to Search and Cockpit: `Icons.Default.Bookmark` / `Icons.Default.History` ("Histórico & Salvos").
+   - Controls state `showHistoryDialog: MutableStateFlow<Boolean>`.
+2. **Post-Ride Summary Dialog (`RideSummaryDialog`)**:
+   - Appears immediately upon arriving at the destination or ending navigation.
+   - Shows summary statistics card:
+     - Distance, duration, avg speed, elevation.
+     - Mode badge: "Bicicleta Convencional" vs "E-Bike (Tour/Eco)".
+   - Editable `OutlinedTextField` for custom ride title (prefilled with e.g. "Pedal em [Data]").
+   - Action buttons: "Salvar no Histórico" (EmeraldGreen) vs "Descartar" (Slate700).
+3. **History & Saved Sheet (`RideHistorySheet.kt`)**:
+   - **Tab 1: Histórico de Pedais**:
+     - `LazyColumn` of ride cards sorted by timestamp descending.
+     - Distinguishes standard bike vs e-bike visually.
+     - Swipe-to-delete or delete icon button with `ConfirmDeleteDialog`.
+     - Rename icon button opening `RenameDialog`.
+     - "Repetir no Mapa": loads the polyline on the map for viewing.
+   - **Tab 2: Rotas Salvas**:
+     - List of saved itineraries with profile tags, distance, and duration.
+     - "Navegar Agora": populates waypoints and opens planner.
+     - Rename / Delete options.
+   - **Tab 3: Locais Favoritos**:
+     - List of saved locations (Home, Work, custom).
+     - "Ir para cá": sets destination waypoint.
+4. **Integration into `WaypointSearchDialog.kt`**:
+   - Quick Favorites Row displayed when search query is empty.
+   - Bookmark icon on each search result item to save directly into favorites.
+5. **Integration into `RoutePlannerSheet.kt`**:
+   - A "Salvar Rota" button placed on the active route preview card.
+
+---
+
+## 7. Step-by-Step Implementation Roadmap
+
+| Step | Scope | Description |
+| :--- | :--- | :--- |
+| **Phase 1** | Gradle Setup | Add KSP plugin to root and app `build.gradle.kts`, add `androidx.room` runtime, ktx, and compiler dependencies. |
+| **Phase 2** | Local Data Layer | Implement `RideHistoryEntity`, `SavedRouteEntity`, `SavedDestinationEntity`, Room type converters, DAOs, and `AppDatabase`. |
+| **Phase 3** | Repository Layer | Create `BikeRepository` interface and `BikeRepositoryImpl` managing coroutines on `Dispatchers.IO`. |
+| **Phase 4** | ViewModel Hooks | Inject repository into `BikeMapViewModel`. Wire navigation completion to `completedRideSummary`, add save/load/rename/delete methods. |
+| **Phase 5** | UI Components | Create `RideHistorySheet`, `RideSummaryDialog`, `RenameDialog`, and `ConfirmDeleteDialog`. |
+| **Phase 6** | Search & Planner UI | Integrate favorite destinations row into `WaypointSearchDialog` and "Salvar Rota" into `RoutePlannerSheet`. |
+| **Phase 7** | Verification | Test normal bike rides (no battery data saved), e-bike rides (battery data saved), database migrations, route loading, and deletion. |
+
+---
+
+## 8. Verification & Edge Cases
+
+1. **Normal Bike Mode Integrity**:
+   - Verify that rides performed with regular bike settings have `isEBikeMode = false` and `energyConsumedWh = null`, ensuring the UI cleanly hides battery cards.
+2. **Zero-Distance / Accidental Clicks**:
+   - Guard `completedRideSummary` against short aborts (< 50 meters or < 15 seconds) so database is not polluted.
+3. **Database Versioning & Migration**:
+   - Initial version `version = 1`. If schema evolves, specify clean Room migrations or `fallbackToDestructiveMigration()` during development.
+4. **Polyline Compression**:
+   - Store polylines as Google Polyline Algorithm encoded strings (or serialized coordinate JSON) to avoid large payload overhead in SQLite.

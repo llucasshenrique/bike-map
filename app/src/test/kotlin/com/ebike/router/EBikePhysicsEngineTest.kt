@@ -46,4 +46,67 @@ class EBikePhysicsEngineTest {
         assertTrue("Downhill steep segment should produce negative or zero energy (regen)", result.energyWh <= 0.0)
         assertEquals(0, result.motorWatt)
     }
+
+    @Test
+    fun testRoughSurfaceIncreasesEnergyConsumption() {
+        val smooth = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = 0.0,
+            targetSpeedKmh = 20.0,
+            assistLevel = AssistLevel.TOUR,
+            rollingMultiplier = 1.0
+        )
+        val rough = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = 0.0,
+            targetSpeedKmh = 20.0,
+            assistLevel = AssistLevel.TOUR,
+            rollingMultiplier = 2.1
+        )
+        assertTrue(
+            "Rougher surface (higher rolling resistance) should draw more energy",
+            rough.energyWh > smooth.energyWh
+        )
+    }
+
+    @Test
+    fun testHighRollingResistanceCapsEffectiveSpeed() {
+        val result = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = 0.0,
+            targetSpeedKmh = 30.0,
+            assistLevel = AssistLevel.TOUR,
+            rollingMultiplier = 1.85
+        )
+        val baseline = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 1000.0,
+            gradePercent = 0.0,
+            targetSpeedKmh = 30.0,
+            assistLevel = AssistLevel.TOUR,
+            rollingMultiplier = 1.0
+        )
+        assertTrue(
+            "Surface roughness above the 1.4 threshold should cap speed and take longer",
+            result.durationSeconds >= baseline.durationSeconds
+        )
+    }
+
+    @Test
+    fun testDefaultRollingMultiplierMatchesExplicitBaseline() {
+        val default = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 500.0,
+            gradePercent = 1.0,
+            targetSpeedKmh = 25.0,
+            assistLevel = AssistLevel.SPORT
+        )
+        val explicit = physicsEngine.calculateSegmentEnergy(
+            distanceMeters = 500.0,
+            gradePercent = 1.0,
+            targetSpeedKmh = 25.0,
+            assistLevel = AssistLevel.SPORT,
+            rollingMultiplier = 1.0
+        )
+        assertEquals(explicit.energyWh, default.energyWh, 0.001)
+        assertEquals(explicit.durationSeconds, default.durationSeconds)
+    }
 }
