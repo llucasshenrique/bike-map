@@ -66,15 +66,16 @@ wrote the feature.
   `./gradlew` can't find the SDK outside Orca's own tooling, check `local.properties`/
   `$ANDROID_HOME`/`$ANDROID_SDK_ROOT` for the actual local install path rather than assuming
   one — it varies by machine.
-- **No Android emulator works in at least one known sandbox environment** — boots died silently
-  ~15-20s in, with no OOM/kernel evidence found. Don't sink time into an emulator before
-  confirming (quickly) whether it works on the current host. Prefer **Paparazzi** regardless
-  (`app.cash.paparazzi` plugin, already applied to `:app`) for any UI-visual change:
-  `./gradlew :app:recordPaparazziDebug --tests "*YourTest*"`
-  renders Compose composables to PNG via a JVM-only layoutlib, no device needed. The user
-  explicitly wants screenshots (or short recordings, where feasible) of UI changes so they can
-  review without building/launching the app themselves — treat this as a standing requirement
-  for UI PRs, not a one-off ask.
+- Default to **Paparazzi** (`app.cash.paparazzi` plugin, already applied to `:app`) for any
+  UI-visual change: `./gradlew :app:recordPaparazziDebug --tests "*YourTest*"` renders Compose
+  composables to PNG via a JVM-only layoutlib, no device needed, and works reliably regardless
+  of host. The user explicitly wants screenshots (or short recordings, where feasible) of UI
+  changes so they can review without building/launching the app themselves — treat this as a
+  standing requirement for UI PRs, not a one-off ask.
+- If a task genuinely needs a real device/emulator (e.g. instrumented tests, manual QA that
+  Paparazzi can't cover), do a quick timed check that an AVD actually boots on the current host
+  before committing to that path, and fall back to Paparazzi/unit-level coverage if it doesn't
+  boot within a couple of minutes rather than debugging emulator infrastructure at length.
 
 ## CI
 
