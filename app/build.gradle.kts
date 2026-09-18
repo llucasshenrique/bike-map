@@ -2,6 +2,7 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
     id("app.cash.paparazzi")
 }
 
@@ -55,6 +56,13 @@ android {
     lint {
         baseline = file("lint-baseline.xml")
     }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -84,6 +92,12 @@ dependencies {
 
     // Location
     implementation("com.google.android.gms:play-services-location:21.3.0")
+
+    // Room Persistence
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
 
     // Testing
     testImplementation("junit:junit:4.13.2")
