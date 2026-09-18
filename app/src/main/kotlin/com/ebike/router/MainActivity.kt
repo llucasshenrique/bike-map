@@ -102,6 +102,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
     val activeRoute by viewModel.activeRoute.collectAsState()
     val telemetry by viewModel.telemetry.collectAsState()
     val waypoints by viewModel.waypoints.collectAsState()
+    val downloadProgress by viewModel.downloadProgress.collectAsState()
 
     val showHistorySheet by viewModel.showHistorySheet.collectAsState()
     val completedRideSummary by viewModel.completedRideSummary.collectAsState()
@@ -417,7 +418,10 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                     onStartNavigation = { viewModel.startNavigation(it) },
                     onStartSimulation = { viewModel.startSimulation(2) },
                     onSaveRoute = { viewModel.saveCurrentRoute() },
-                    onClose = { viewModel.showRoutePlannerSheet.value = false }
+                    onClose = { viewModel.showRoutePlannerSheet.value = false },
+                    estimatedOfflineTiles = activeRoute?.let { viewModel.estimateOfflineTileCount(it) } ?: 0,
+                    downloadProgress = downloadProgress,
+                    onDownloadOfflineMap = { viewModel.downloadOfflineMap(it) }
                 )
             }
         }

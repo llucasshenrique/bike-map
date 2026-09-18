@@ -23,6 +23,8 @@ import com.ebike.router.service.AudioGuidanceService
 import com.ebike.router.service.GeocodingService
 import com.ebike.router.service.GraphRouterService
 import com.ebike.router.service.LocationTrackerService
+import com.ebike.router.service.OfflineDownloadState
+import com.ebike.router.service.OfflineTileCacheService
 import com.ebike.router.service.RiderLocationState
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -62,6 +64,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     val routerService = GraphRouterService(physicsEngine, application)
     val geocodingService = GeocodingService()
     val audioGuidance = AudioGuidanceService(application)
+    val offlineTileCacheService = OfflineTileCacheService()
 
     // Service binding state
     private var serviceConnection: ServiceConnection? = null
@@ -169,6 +172,51 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     fun recenterMap() {
         locationTracker.refreshCurrentLocation()
         recenterEvent.value = System.currentTimeMillis()
+    }
+
+    // --- OFFLINE MAP TILE CACHE ---
+
+    private val _downloadProgress = MutableStateFlow<OfflineDownloadState>(OfflineDownloadState.Idle)
+    val downloadProgress: StateFlow<OfflineDownloadState> = _downloadProgress.asStateFlow()
+
+    // Route pending a region pre-download; consumed by OsmdroidMapView, which owns
+    // the live MapView that CacheManager needs to validate the tile source policy.
+    private val _offlineDownloadRequest = MutableStateFlow<RouteResult?>(null)
+    val offlineDownloadRequest: StateFlow<RouteResult?> = _offlineDownloadRequest.asStateFlow()
+
+    fun estimateOfflineTileCount(route: RouteResult): Int {
+        val bbox = offlineTileCacheService.boundingBoxForRoute(route.coordinates) ?: return 0
+        return offlineTileCacheService.estimateTileCount(bbox)
+    }
+
+    fun downloadOfflineMap(route: RouteResult) {
+        if (_downloadProgress.value is OfflineDownloadState.Running) return
+        val count = estimateOfflineTileCount(route)
+        if (count <= 0) {
+            _downloadProgress.value = OfflineDownloadState.Error("Região inválida para download")
+            return
+        }
+        _downloadProgress.value = OfflineDownloadState.Running(0, count)
+        _offlineDownloadRequest.value = route
+    }
+
+    fun onOfflineDownloadProgress(downloaded: Int, total: Int) {
+        _downloadProgress.value = OfflineDownloadState.Running(downloaded, total)
+    }
+
+    fun onOfflineDownloadFinished(success: Boolean) {
+        _downloadProgress.value = if (success) {
+            OfflineDownloadState.Done
+        } else {
+            OfflineDownloadState.Error("Falha ao baixar mapa offline")
+        }
+        _offlineDownloadRequest.value = null
+    }
+
+    fun resetOfflineDownloadState() {
+        offlineTileCacheService.cancelDownload()
+        _downloadProgress.value = OfflineDownloadState.Idle
+        _offlineDownloadRequest.value = null
     }
 
     // UI Sheets / Dialogs

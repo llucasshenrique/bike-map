@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.*
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.preference.PreferenceManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
@@ -37,6 +38,7 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import java.io.File
 
 /**
  * Night-mode tile filter: inverts tile luminance, then desaturates and dims the
@@ -86,9 +88,50 @@ fun OsmdroidMapView(
     var isDarkMapTiles by remember { mutableStateOf(systemInDarkTheme) }
 
     DisposableEffect(Unit) {
-        Configuration.getInstance().userAgentValue = "EBikeRouterAndroid/1.0"
+        val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+        Configuration.getInstance().load(context, prefs)
+        Configuration.getInstance().apply {
+            userAgentValue = "EBikeRouterAndroid/1.0"
+            // App-private, no storage permission needed, survives app restarts.
+            osmdroidBasePath = File(context.filesDir, "osmdroid")
+            osmdroidTileCache = File(osmdroidBasePath, "tiles")
+            tileFileSystemCacheMaxBytes = 500L * 1024 * 1024
+            tileFileSystemCacheTrimBytes = 400L * 1024 * 1024
+            // Serve cached tiles immediately offline instead of waiting on a timed-out
+            // network revalidation per tile.
+            expirationOverrideDuration = 30L * 24 * 60 * 60 * 1000
+        }
         onDispose {
+            viewModel.offlineTileCacheService.cancelDownload()
             mapViewRef?.onDetach()
+        }
+    }
+
+    // Region pre-download requested from the route planner: executed here because
+    // CacheManager needs a live, attached MapView to validate the tile source policy.
+    val offlineDownloadRequest by viewModel.offlineDownloadRequest.collectAsState()
+    LaunchedEffect(offlineDownloadRequest) {
+        val route = offlineDownloadRequest ?: return@LaunchedEffect
+        val map = mapViewRef
+        if (map == null) {
+            viewModel.onOfflineDownloadFinished(false)
+            return@LaunchedEffect
+        }
+        val bbox = viewModel.offlineTileCacheService.boundingBoxForRoute(route.coordinates)
+        if (bbox == null) {
+            viewModel.onOfflineDownloadFinished(false)
+            return@LaunchedEffect
+        }
+        try {
+            viewModel.offlineTileCacheService.downloadRegion(
+                context = context,
+                mapView = map,
+                bbox = bbox,
+                onProgress = { downloaded, total -> viewModel.onOfflineDownloadProgress(downloaded, total) },
+                onDone = { success -> viewModel.onOfflineDownloadFinished(success) }
+            )
+        } catch (e: Exception) {
+            viewModel.onOfflineDownloadFinished(false)
         }
     }
 
