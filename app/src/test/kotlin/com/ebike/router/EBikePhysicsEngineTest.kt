@@ -336,5 +336,4 @@ class EBikePhysicsEngineTest {
         assertEquals(explicit.energyWh, default.energyWh, 0.001)
         assertEquals(explicit.durationSeconds, default.durationSeconds)
     }
-    }
 }

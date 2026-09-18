@@ -39,7 +39,7 @@ class WayTagsIndex(
 
 class GraphRouterService(
     private val physicsEngine: EBikePhysicsEngine,
-    context: Context
+    context: Context? = null
 ) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(7, TimeUnit.SECONDS)
@@ -48,11 +48,15 @@ class GraphRouterService(
 
     private val gson = Gson()
 
-    private val elevationProvider: ElevationProvider = CompositeElevationProvider(
-        database = ElevationDatabase(context.applicationContext),
-        srtmProvider = SrtmElevationProvider(SrtmTileManager(context.applicationContext)),
-        remoteProvider = RemoteElevationProvider()
-    )
+    private val elevationProvider: ElevationProvider = if (context != null) {
+        CompositeElevationProvider(
+            database = ElevationDatabase(context.applicationContext),
+            srtmProvider = SrtmElevationProvider(SrtmTileManager(context.applicationContext)),
+            remoteProvider = RemoteElevationProvider()
+        )
+    } else {
+        RemoteElevationProvider()
+    }
 
     suspend fun calculateMultipleRoutes(
         points: List<GeoPoint>,

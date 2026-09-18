@@ -258,7 +258,6 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         bindService(application)
-    }
 
         // Sync physics engine and telemetry with persisted preferences
         viewModelScope.launch {
