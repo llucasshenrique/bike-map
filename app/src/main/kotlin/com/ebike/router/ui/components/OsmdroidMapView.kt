@@ -56,6 +56,7 @@ fun OsmdroidMapView(
             expirationOverrideDuration = 30L * 24 * 60 * 60 * 1000
         }
         onDispose {
+            viewModel.offlineTileCacheService.cancelDownload()
             mapViewRef?.onDetach()
         }
     }
@@ -65,16 +66,27 @@ fun OsmdroidMapView(
     val offlineDownloadRequest by viewModel.offlineDownloadRequest.collectAsState()
     LaunchedEffect(offlineDownloadRequest) {
         val route = offlineDownloadRequest ?: return@LaunchedEffect
-        val map = mapViewRef ?: return@LaunchedEffect
+        val map = mapViewRef
+        if (map == null) {
+            viewModel.onOfflineDownloadFinished(false)
+            return@LaunchedEffect
+        }
         val bbox = viewModel.offlineTileCacheService.boundingBoxForRoute(route.coordinates)
-            ?: return@LaunchedEffect
-        viewModel.offlineTileCacheService.downloadRegion(
-            context = context,
-            mapView = map,
-            bbox = bbox,
-            onProgress = { downloaded, total -> viewModel.onOfflineDownloadProgress(downloaded, total) },
-            onDone = { success -> viewModel.onOfflineDownloadFinished(success) }
-        )
+        if (bbox == null) {
+            viewModel.onOfflineDownloadFinished(false)
+            return@LaunchedEffect
+        }
+        try {
+            viewModel.offlineTileCacheService.downloadRegion(
+                context = context,
+                mapView = map,
+                bbox = bbox,
+                onProgress = { downloaded, total -> viewModel.onOfflineDownloadProgress(downloaded, total) },
+                onDone = { success -> viewModel.onOfflineDownloadFinished(success) }
+            )
+        } catch (e: Exception) {
+            viewModel.onOfflineDownloadFinished(false)
+        }
     }
 
     AndroidView(

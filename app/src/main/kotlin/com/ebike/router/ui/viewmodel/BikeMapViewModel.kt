@@ -104,7 +104,12 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
 
     fun downloadOfflineMap(route: RouteResult) {
         if (_downloadProgress.value is OfflineDownloadState.Running) return
-        _downloadProgress.value = OfflineDownloadState.Running(0, estimateOfflineTileCount(route))
+        val count = estimateOfflineTileCount(route)
+        if (count <= 0) {
+            _downloadProgress.value = OfflineDownloadState.Error("Região inválida para download")
+            return
+        }
+        _downloadProgress.value = OfflineDownloadState.Running(0, count)
         _offlineDownloadRequest.value = route
     }
 
@@ -122,7 +127,9 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun resetOfflineDownloadState() {
+        offlineTileCacheService.cancelDownload()
         _downloadProgress.value = OfflineDownloadState.Idle
+        _offlineDownloadRequest.value = null
     }
 
     // UI Sheets / Dialogs
