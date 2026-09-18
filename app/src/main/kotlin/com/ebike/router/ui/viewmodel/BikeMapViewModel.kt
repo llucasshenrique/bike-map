@@ -16,7 +16,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.max
-import kotlin.math.min
 
 class BikeMapViewModel(application: Application) : AndroidViewModel(application) {
     val physicsEngine = EBikePhysicsEngine()
@@ -298,6 +297,13 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         var elapsedSec = 0
         var speedSum = 0.0
         var speedCount = 0
+        val recentSpeedsKmh = ArrayDeque<Double>()
+
+        // Planned average speed from the route plan, used only as a fallback when we have no
+        // GPS-derived speed yet (e.g. the first tick after starting navigation).
+        val plannedAvgSpeedKmh = if (route.totalDurationSeconds > 0) {
+            (route.totalDistanceMeters / 1000.0) / (route.totalDurationSeconds / 3600.0)
+        } else 0.0
 
         rideTimerJob = viewModelScope.launch {
             while (_isNavigating.value) {
@@ -310,10 +316,28 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
                 speedCount++
                 val avgSpeed = if (speedCount > 0) speedSum / speedCount else 0.0
 
-                val progressRatio = min(1.0, elapsedSec / max(1.0, route.totalDurationSeconds.toDouble()))
-                val distRidden = (route.totalDistanceMeters * progressRatio) / 1000.0
-                val distRemaining = max(0.0, (route.totalDistanceMeters / 1000.0) - distRidden)
-                val timeRemaining = max(0, route.totalDurationSeconds - elapsedSec)
+                recentSpeedsKmh.addLast(speed)
+                if (recentSpeedsKmh.size > RECENT_SPEED_WINDOW) recentSpeedsKmh.removeFirst()
+                val recentAvgSpeed = if (recentSpeedsKmh.isNotEmpty()) {
+                    recentSpeedsKmh.sum() / recentSpeedsKmh.size
+                } else 0.0
+
+                val progress = projectPointOntoRoute(route.coordinates, curLoc.point)
+                val distRemaining = progress.remainingDistanceMeters / 1000.0
+                val distRidden = max(0.0, (route.totalDistanceMeters / 1000.0) - distRemaining)
+
+                // Prefer a recent-speed average (smooths out GPS jitter) over instantaneous speed;
+                // fall back to the route's planned average speed if the rider hasn't moved yet.
+                val etaSpeedKmh = when {
+                    recentAvgSpeed > 1.0 -> recentAvgSpeed
+                    speed > 1.0 -> speed
+                    else -> plannedAvgSpeedKmh
+                }
+                val timeRemaining = if (etaSpeedKmh > 0.1) {
+                    ((distRemaining / etaSpeedKmh) * 3600.0).toInt()
+                } else {
+                    max(0, route.totalDurationSeconds - elapsedSec)
+                }
 
                 val batTelem = physicsEngine.getBatteryTelemetry()
 
@@ -381,4 +405,73 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         locationTracker.stopSimulator()
         audioGuidance.shutdown()
     }
+
+    companion object {
+        private const val RECENT_SPEED_WINDOW = 12
+
+        /**
+         * Projects [point] onto the polyline [coordinates] (the rider's snapped position on the
+         * route) and returns the remaining distance from that snapped position to the end of the
+         * route, following the polyline rather than a straight line.
+         */
+        internal fun projectPointOntoRoute(coordinates: List<GeoPoint>, point: GeoPoint): RouteProjection {
+            if (coordinates.size < 2) {
+                return RouteProjection(remainingDistanceMeters = 0.0, snappedPoint = coordinates.firstOrNull() ?: point)
+            }
+
+            var bestSegmentIndex = 0
+            var bestProjected = coordinates[0]
+            var bestDistanceToPoint = Double.MAX_VALUE
+
+            for (i in 0 until coordinates.size - 1) {
+                val a = coordinates[i]
+                val b = coordinates[i + 1]
+                val t = projectionFraction(a, b, point)
+                val projected = interpolatePoint(a, b, t)
+                val distanceToPoint = point.distanceTo(projected)
+                if (distanceToPoint < bestDistanceToPoint) {
+                    bestDistanceToPoint = distanceToPoint
+                    bestSegmentIndex = i
+                    bestProjected = projected
+                }
+            }
+
+            var remaining = bestProjected.distanceTo(coordinates[bestSegmentIndex + 1])
+            for (i in (bestSegmentIndex + 1) until coordinates.size - 1) {
+                remaining += coordinates[i].distanceTo(coordinates[i + 1])
+            }
+
+            return RouteProjection(remainingDistanceMeters = remaining, snappedPoint = bestProjected)
+        }
+
+        /** Fraction (0..1) along segment a->b closest to p, using a local planar approximation. */
+        private fun projectionFraction(a: GeoPoint, b: GeoPoint, p: GeoPoint): Double {
+            val metersPerDegLat = 111320.0
+            val metersPerDegLng = 111320.0 * Math.cos(Math.toRadians(a.lat))
+
+            val bx = (b.lng - a.lng) * metersPerDegLng
+            val by = (b.lat - a.lat) * metersPerDegLat
+            val px = (p.lng - a.lng) * metersPerDegLng
+            val py = (p.lat - a.lat) * metersPerDegLat
+
+            val lenSq = bx * bx + by * by
+            if (lenSq < 1e-9) return 0.0
+
+            val t = (px * bx + py * by) / lenSq
+            return t.coerceIn(0.0, 1.0)
+        }
+
+        private fun interpolatePoint(a: GeoPoint, b: GeoPoint, t: Double): GeoPoint {
+            return GeoPoint(
+                lat = a.lat + (b.lat - a.lat) * t,
+                lng = a.lng + (b.lng - a.lng) * t,
+                ele = a.ele + (b.ele - a.ele) * t
+            )
+        }
+    }
+
+    internal data class RouteProjection(
+        val remainingDistanceMeters: Double,
+        val snappedPoint: GeoPoint
+    )
 }
