@@ -46,11 +46,24 @@ built-in agent id). Instead:
 
 ## Concurrency limits
 
-The user sets and changes this over time — **do not assume a default, confirm/recall the
-current limit before dispatching**. As of the last instruction: **1 dev agent at a time,
-excluding yourself as coordinator.** Earlier in this project it was 4 dev + 2 QA (independent
-test-writer) agents, split evenly between `agy` and `claude`. Whatever the current limit is,
-respect it strictly and queue additional work rather than exceeding it.
+The user controls how many agents may run at once and which tools they're split across, and
+changes this over time — **never assume a number, recall or ask for the current limit before
+dispatching**. Once you have it: respect it strictly (it does not include you as coordinator
+unless told otherwise), queue additional work rather than exceeding it, and re-derive the limit
+each session rather than trusting a number from an earlier conversation.
+
+## When you are the one being orchestrated
+
+If your session carries an injected preamble with a Task/Dispatch ID (i.e. you were started by
+`worker-start`/`dispatch`), that preamble is authoritative:
+- Do only the current Task; use its `ask` command for a blocking question to the coordinator
+  instead of opening a local prompt it can't see.
+- Send heartbeats only at the cadence it specifies — a heartbeat proves liveness, not progress.
+- Check for coordinator follow-ups at natural checkpoints and once more right before finishing.
+- Report completion exactly once, from your own terminal, with `worker_done` (or the manual
+  fallback in the `agy` notes above if your tooling can't reach that command directly): a short
+  summary, both lifecycle IDs, and an explicit succeeded/failed outcome — never leave the
+  outcome implicit in prose. Then stop; don't keep polling or start new work uninstructed.
 
 ## Independent test authorship (hard rule)
 
