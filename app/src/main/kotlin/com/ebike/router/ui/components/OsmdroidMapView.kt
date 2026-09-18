@@ -81,6 +81,9 @@ fun OsmdroidMapView(
     val activeRoute by viewModel.activeRoute.collectAsState()
     val locationState by viewModel.locationTracker.locationState.collectAsState()
     val activePickingIdx by viewModel.activePickingWaypointIndex.collectAsState()
+    val isEBike by viewModel.isEBikeMode.collectAsState()
+    val showRangeCircle by viewModel.showRangeCircle.collectAsState()
+    val telemetry by viewModel.telemetry.collectAsState()
 
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
     var riderMarker by remember { mutableStateOf<Marker?>(null) }
@@ -276,6 +279,20 @@ fun OsmdroidMapView(
 
                 // 4. Draw Rider Position Marker
                 val riderPt = OsmGeoPoint(locationState.point.lat, locationState.point.lng)
+
+                // 5. Draw Estimated Range Circle (Only in E-Bike Mode)
+                val bat = telemetry.batteryTelemetry
+                if (isEBike && showRangeCircle && bat != null && bat.estimatedRangeKm > 0.0) {
+                    val circle = org.osmdroid.views.overlay.Polygon(map).apply {
+                        points = org.osmdroid.views.overlay.Polygon.pointsAsCircle(riderPt, bat.estimatedRangeKm * 1000.0)
+                        fillPaint.color = Color.argb(20, 6, 182, 212)
+                        outlinePaint.color = Color.argb(80, 6, 182, 212)
+                        outlinePaint.strokeWidth = 3f
+                        title = "Autonomia Estimada: ~${bat.estimatedRangeKm} km"
+                    }
+                    map.overlays.add(circle)
+                }
+
                 val rider = Marker(map).apply {
                     position = riderPt
                     icon = createRiderDrawable(context)

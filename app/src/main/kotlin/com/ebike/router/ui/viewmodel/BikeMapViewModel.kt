@@ -23,6 +23,8 @@ import com.ebike.router.service.AudioGuidanceService
 import com.ebike.router.service.GeocodingService
 import com.ebike.router.service.GraphRouterService
 import com.ebike.router.service.LocationTrackerService
+import com.ebike.router.data.BikePreferencesRepository
+import com.ebike.router.data.UserBikePreferences
 import com.ebike.router.service.OfflineDownloadState
 import com.ebike.router.service.OfflineTileCacheService
 import com.ebike.router.service.RiderLocationState
@@ -34,6 +36,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -64,7 +67,22 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     val routerService = GraphRouterService(physicsEngine, application)
     val geocodingService = GeocodingService()
     val audioGuidance = AudioGuidanceService(application)
+    val bikePreferencesRepo = BikePreferencesRepository(application)
     val offlineTileCacheService = OfflineTileCacheService()
+
+    val bikePreferences: StateFlow<UserBikePreferences> = bikePreferencesRepo.bikePreferencesFlow.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.Eagerly,
+        initialValue = UserBikePreferences()
+    )
+
+    val isEBikeMode: StateFlow<Boolean> = bikePreferencesRepo.bikePreferencesFlow
+        .map { it.isEBikeMode }
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = false
+        )
 
     // Service binding state
     private var serviceConnection: ServiceConnection? = null
@@ -155,8 +173,14 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     private var consecutiveOffRouteSamples: Int = 0
     private var rerouteCooldownUntilMillis: Long = 0L
 
-    // Live Telemetry
-    private val _telemetry = MutableStateFlow(LiveRideTelemetry())
+    // Live Telemetry (starts in normal bike mode by default)
+    private val _telemetry = MutableStateFlow(
+        LiveRideTelemetry(
+            isEBikeMode = false,
+            batteryTelemetry = null,
+            activeAssist = AssistLevel.OFF
+        )
+    )
     val telemetry: StateFlow<LiveRideTelemetry> = _telemetry.asStateFlow()
 
     // Search
@@ -223,6 +247,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     val showRoutePlannerSheet = MutableStateFlow(false)
     val showSearchDialogForIndex = MutableStateFlow<Int?>(null)
     val showCockpitDialog = MutableStateFlow(false)
+    val showSettingsDialog = MutableStateFlow(false)
     val showRangeCircle = MutableStateFlow(true)
     val showHistorySheet = MutableStateFlow(false)
     val completedRideSummary = MutableStateFlow<RideHistoryEntity?>(null)
@@ -233,6 +258,18 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         bindService(application)
+
+        // Sync physics engine and telemetry with persisted preferences
+        viewModelScope.launch {
+            bikePreferencesRepo.bikePreferencesFlow.collect { prefs ->
+                physicsEngine.syncWithPreferences(prefs)
+                _telemetry.value = _telemetry.value.copy(
+                    isEBikeMode = prefs.isEBikeMode,
+                    batteryTelemetry = if (prefs.isEBikeMode) physicsEngine.getBatteryTelemetry() else null,
+                    activeAssist = if (prefs.isEBikeMode) physicsEngine.getConfig().activeAssist else AssistLevel.OFF
+                )
+            }
+        }
     }
 
     fun bindService(context: Context) {
@@ -407,7 +444,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _isCalculating.value = true
             try {
-                val routes = routerService.calculateMultipleRoutes(validPoints, _selectedProfile.value)
+                val routes = routerService.calculateMultipleRoutes(validPoints, _selectedProfile.value, isEBikeMode.value)
                 _availableRoutes.value = routes
                 if (routes.isNotEmpty()) {
                     selectRoute(0)
@@ -425,6 +462,50 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
             val route = routes[index]
             activeRoute.value = route
             _currentInstruction.value = route.instructions.firstOrNull()
+        }
+    }
+
+    // --- PREFERENCES & CONFIGURATION ---
+
+    fun updateEBikeMode(enabled: Boolean) {
+        viewModelScope.launch {
+            bikePreferencesRepo.updateEBikeMode(enabled)
+            if (hasEnoughValidPoints()) {
+                calculateRoute()
+            }
+        }
+    }
+
+    fun updateBikeSpecs(
+        batteryCapacityWh: Double,
+        maxAssistSpeedKmh: Double,
+        bikeWeightKg: Double,
+        riderWeightKg: Double,
+        regenerativeBraking: Boolean = false
+    ) {
+        viewModelScope.launch {
+            bikePreferencesRepo.updateBikeSpecs(
+                batteryCapacityWh = batteryCapacityWh,
+                maxAssistSpeedKmh = maxAssistSpeedKmh,
+                bikeWeightKg = bikeWeightKg,
+                riderWeightKg = riderWeightKg,
+                regenerativeBraking = regenerativeBraking
+            )
+            if (hasEnoughValidPoints()) {
+                calculateRoute()
+            }
+        }
+    }
+
+    fun updateCurrentBatteryWh(currentWh: Double) {
+        viewModelScope.launch {
+            bikePreferencesRepo.updateCurrentBatteryWh(currentWh)
+            physicsEngine.updateBatteryWh(currentWh)
+            if (isEBikeMode.value) {
+                _telemetry.value = _telemetry.value.copy(
+                    batteryTelemetry = physicsEngine.getBatteryTelemetry()
+                )
+            }
         }
     }
 
@@ -653,6 +734,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setAssistLevel(level: AssistLevel) {
+        if (!isEBikeMode.value) return
         physicsEngine.setAssistLevel(level)
         _trackerService.value?.setAssistLevel(level)
         _telemetry.value = _telemetry.value.copy(

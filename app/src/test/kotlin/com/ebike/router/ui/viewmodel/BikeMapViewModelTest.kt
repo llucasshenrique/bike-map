@@ -123,6 +123,13 @@ class BikeMapViewModelTest {
 
     @Test
     fun `setAssistLevel delegates to the bound tracker service`() {
+        // setAssistLevel has a guard: if (!isEBikeMode.value) return
+        // Enable e-bike mode via DataStore so isEBikeMode StateFlow emits true.
+        kotlinx.coroutines.runBlocking {
+            viewModel.bikePreferencesRepo.updateEBikeMode(true)
+        }
+        shadowOf(Looper.getMainLooper()).idle()
+
         viewModel.setAssistLevel(AssistLevel.TURBO)
 
         val trackerService = viewModel.trackerService.value

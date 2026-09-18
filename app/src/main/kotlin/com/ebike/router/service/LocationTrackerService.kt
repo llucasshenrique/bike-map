@@ -256,7 +256,7 @@ class LocationTrackerService : Service() {
 
         val elapsedStr = formatDuration(telem.timeElapsedSeconds)
         val textContent = "Velocidade: ${telem.currentSpeedKmh} km/h • Distância: ${telem.distanceRiddenKm} km • Tempo: $elapsedStr"
-        val subText = "Bateria: ${telem.batteryTelemetry.percentage}% • Modo: ${telem.activeAssist.name} • Potência: ${telem.motorPowerWatts}W"
+        val subText = "Bateria: ${telem.batteryTelemetry?.percentage ?: "--"}% • Modo: ${telem.activeAssist.name} • Potência: ${telem.motorPowerWatts}W"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)

@@ -97,6 +97,9 @@ fun MainScreen(viewModel: BikeMapViewModel) {
     val showPlannerSheet by viewModel.showRoutePlannerSheet.collectAsState()
     val searchDialogIndex by viewModel.showSearchDialogForIndex.collectAsState()
     val showCockpit by viewModel.showCockpitDialog.collectAsState()
+    val showSettings by viewModel.showSettingsDialog.collectAsState()
+    val isEBike by viewModel.isEBikeMode.collectAsState()
+    val bikePreferences by viewModel.bikePreferences.collectAsState()
     val searchResults by viewModel.searchResults.collectAsState()
     val isSearching by viewModel.isSearching.collectAsState()
     val activeRoute by viewModel.activeRoute.collectAsState()
@@ -184,33 +187,60 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                     }
                 }
 
-                // Battery / Cockpit Pill
+                // Battery / Cockpit Pill (Only shown when E-Bike mode is ON)
+                if (isEBike && telemetry.batteryTelemetry != null) {
+                    val bat = telemetry.batteryTelemetry!!
+                    Surface(
+                        modifier = Modifier
+                            .height(48.dp)
+                            .clickable { viewModel.showCockpitDialog.value = true },
+                        shape = RoundedCornerShape(24.dp),
+                        color = Slate900.copy(alpha = 0.95f),
+                        shadowElevation = 8.dp,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Slate700)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Icon(Icons.Default.ElectricBike, contentDescription = null, tint = EmeraldGreen, modifier = Modifier.size(17.dp))
+                            Text(
+                                text = "${bat.percentage}%",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = EmeraldGreen
+                            )
+                            Surface(
+                                color = CyanPrimary.copy(alpha = 0.2f),
+                                shape = RoundedCornerShape(4.dp)
+                            ) {
+                                Text(
+                                    text = "EST.",
+                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Black,
+                                    color = CyanGlow
+                                )
+                            }
+                        }
+                    }
+                }
                 Surface(
                     modifier = Modifier
-                        .height(48.dp)
-                        .clickable { viewModel.showCockpitDialog.value = true },
-                    shape = RoundedCornerShape(24.dp),
+                        .size(48.dp)
+                        .clickable { viewModel.showSettingsDialog.value = true },
+                    shape = CircleShape,
                     color = Slate900.copy(alpha = 0.95f),
                     shadowElevation = 8.dp,
                     border = androidx.compose.foundation.BorderStroke(1.dp, Slate700)
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 14.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Icon(Icons.Default.ElectricBike, contentDescription = null, tint = EmeraldGreen, modifier = Modifier.size(18.dp))
-                        Text(
-                            text = "${telemetry.batteryTelemetry.percentage}%",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = EmeraldGreen
-                        )
-                        Text(
-                            text = telemetry.activeAssist.name,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Black,
-                            color = CyanGlow
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Default.Settings,
+                            contentDescription = "Configurações",
+                            tint = if (isEBike) CyanGlow else Color.White,
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 }
@@ -279,7 +309,8 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                     viewModel.setAudioMuted(!viewModel.audioGuidance.isMuted)
                 },
                 onStopNavigation = { viewModel.stopNavigation() },
-                onOpenCockpit = { viewModel.showCockpitDialog.value = true }
+                onOpenCockpit = { viewModel.showCockpitDialog.value = true },
+                isEBikeMode = isEBike
             )
         } else if (!showPlannerSheet) {
             // COMPACT BOTTOM CONTROLS (When Planner is minimized)
@@ -306,8 +337,13 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                             ) {
                                 Column {
                                     Text(text = route.name, fontWeight = FontWeight.Bold, color = Color.White, fontSize = 14.sp)
+                                    val subText = if (isEBike) {
+                                        "${(route.totalDistanceMeters / 1000.0 * 10).toInt() / 10.0} km • ${route.totalDurationSeconds / 60} min • -${route.totalEnergyWh} Wh"
+                                    } else {
+                                        "${(route.totalDistanceMeters / 1000.0 * 10).toInt() / 10.0} km • ${route.totalDurationSeconds / 60} min • ▲ ${route.elevationGainM}m"
+                                    }
                                     Text(
-                                        text = "${(route.totalDistanceMeters / 1000.0 * 10).toInt() / 10.0} km • ${route.totalDurationSeconds / 60} min • -${route.totalEnergyWh} Wh",
+                                        text = subText,
                                         color = CyanGlow,
                                         fontSize = 12.sp,
                                         fontWeight = FontWeight.Bold
@@ -421,7 +457,8 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                     onClose = { viewModel.showRoutePlannerSheet.value = false },
                     estimatedOfflineTiles = activeRoute?.let { viewModel.estimateOfflineTileCount(it) } ?: 0,
                     downloadProgress = downloadProgress,
-                    onDownloadOfflineMap = { viewModel.downloadOfflineMap(it) }
+                    onDownloadOfflineMap = { viewModel.downloadOfflineMap(it) },
+                    isEBikeMode = isEBike
                 )
             }
         }
@@ -545,7 +582,22 @@ fun MainScreen(viewModel: BikeMapViewModel) {
             TelemetryCockpitDialog(
                 telemetry = telemetry,
                 onSelectAssist = { viewModel.setAssistLevel(it) },
-                onDismiss = { viewModel.showCockpitDialog.value = false }
+                onDismiss = { viewModel.showCockpitDialog.value = false },
+                isEBikeMode = isEBike,
+                maxAssistSpeedKmh = bikePreferences.maxAssistSpeedKmh
+            )
+        }
+
+        // 10. SETTINGS DIALOG
+        if (showSettings) {
+            SettingsDialog(
+                preferences = bikePreferences,
+                onUpdateEBikeMode = { viewModel.updateEBikeMode(it) },
+                onSaveSpecs = { cap, spd, bWeight, rWeight, regen ->
+                    viewModel.updateBikeSpecs(cap, spd, bWeight, rWeight, regen)
+                },
+                onUpdateCurrentBatteryWh = { viewModel.updateCurrentBatteryWh(it) },
+                onDismiss = { viewModel.showSettingsDialog.value = false }
             )
         }
 

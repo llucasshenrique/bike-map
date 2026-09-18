@@ -1,8 +1,6 @@
 package com.ebike.router.physics
 
-import com.ebike.router.model.AssistLevel
-import com.ebike.router.model.BatteryTelemetry
-import com.ebike.router.model.EBikeConfig
+import com.ebike.router.model.*
 import kotlin.math.atan
 import kotlin.math.cos
 import kotlin.math.max
@@ -24,6 +22,18 @@ class EBikePhysicsEngine(
         config = newConfig
     }
 
+    fun syncWithPreferences(prefs: com.ebike.router.data.UserBikePreferences) {
+        config = config.copy(
+            batteryCapacityWh = prefs.batteryCapacityWh,
+            currentBatteryWh = prefs.currentBatteryWh,
+            maxAssistSpeedKmh = prefs.maxAssistSpeedKmh,
+            bikeWeightKg = prefs.bikeWeightKg,
+            riderWeightKg = prefs.riderWeightKg,
+            regenerativeBraking = prefs.regenerativeBraking,
+            activeAssist = if (prefs.isEBikeMode) config.activeAssist else AssistLevel.OFF
+        )
+    }
+
     fun setAssistLevel(level: AssistLevel) {
         config = config.copy(activeAssist = level)
     }
@@ -33,9 +43,9 @@ class EBikePhysicsEngine(
     }
 
     fun getBatteryTelemetry(): BatteryTelemetry {
-        val pct = max(0, min(100, ((config.currentBatteryWh / config.batteryCapacityWh) * 100).toInt()))
+        val pct = max(0, min(100, ((config.currentBatteryWh / max(1.0, config.batteryCapacityWh)) * 100).toInt()))
         val avgWhPerKm = getAverageWhPerKm(config.activeAssist)
-        val rangeKm = if (avgWhPerKm > 0) config.currentBatteryWh / avgWhPerKm else 0.0
+        val rangeKm = if (avgWhPerKm > 0) max(0.0, config.currentBatteryWh / avgWhPerKm) else 0.0
         val voltage = 36.0 * (0.85 + 0.15 * (pct / 100.0))
 
         return BatteryTelemetry(
@@ -43,7 +53,8 @@ class EBikePhysicsEngine(
             maxWh = config.batteryCapacityWh,
             percentage = pct,
             estimatedRangeKm = (rangeKm * 10).toInt() / 10.0,
-            voltageApprox = (voltage * 10).toInt() / 10.0
+            voltageApprox = (voltage * 10).toInt() / 10.0,
+            origin = TelemetryOrigin.SIMULATED_ESTIMATE
         )
     }
 
@@ -71,14 +82,47 @@ class EBikePhysicsEngine(
         assistLevel: AssistLevel = config.activeAssist,
         rollingMultiplier: Double = 1.0
     ): SegmentEnergyResult {
-        // Cap speed based on assist limit, slope and surface roughness (CONTRAN 996/2023: max 32 km/h assist)
-        val maxSurfaceSpeed = if (rollingMultiplier > 1.4) min(targetSpeedKmh, 22.0) else targetSpeedKmh
-        val effectiveSpeedKmh = max(5.0, min(assistLevel.maxSpeedKmh + 5.0, maxSurfaceSpeed))
-        val speedMs = effectiveSpeedKmh / 3.6
-        val durationSeconds = max(1, (distanceMeters / speedMs).toInt())
-
         val totalMass = config.bikeWeightKg + config.riderWeightKg
         val theta = atan(gradePercent / 100.0)
+
+        // If assist is OFF (normal bike or motor turned off):
+        if (assistLevel.motorAssistRatio <= 0.0) {
+            // Human aerobic sustained power (~150W)
+            val humanPowerWatts = 150.0
+            val effectiveSpeedKmh = if (gradePercent > 0.0) {
+                // On inclines, speed naturally drops based on gravity & rolling resistance: v = P / F
+                val fGravity = totalMass * GRAVITY * sin(theta)
+                val fRolling = config.tireRollingCoeff * rollingMultiplier * totalMass * GRAVITY * cos(theta)
+                val fResistance = fGravity + fRolling
+                val climbSpeedMs = if (fResistance > 0) humanPowerWatts / fResistance else 5.0
+                val calculatedKmh = climbSpeedMs * 3.6
+                max(5.0, min(targetSpeedKmh, calculatedKmh))
+            } else {
+                max(5.0, targetSpeedKmh)
+            }
+
+            val speedMs = effectiveSpeedKmh / 3.6
+            val durationSeconds = max(1, (distanceMeters / speedMs).toInt())
+
+            val fRolling = config.tireRollingCoeff * rollingMultiplier * totalMass * GRAVITY * cos(theta)
+            val fGravity = totalMass * GRAVITY * sin(theta)
+            val fAero = 0.5 * AIR_DENSITY * config.aerodynamicCdA * speedMs.pow(2)
+            val powerTotal = (fRolling + fGravity + fAero) * speedMs
+
+            return SegmentEnergyResult(
+                energyWh = 0.0,
+                durationSeconds = durationSeconds,
+                motorWatt = 0,
+                riderWatt = if (powerTotal <= 0) 10 else min(450.0, max(40.0, powerTotal)).toInt()
+            )
+        }
+
+        // Motor assisted cycling
+        val maxSurfaceSpeed = if (rollingMultiplier > 1.4) min(targetSpeedKmh, 22.0) else targetSpeedKmh
+        val maxSpeedLimit = min(assistLevel.maxSpeedKmh, config.maxAssistSpeedKmh)
+        val effectiveSpeedKmh = max(5.0, min(maxSpeedLimit + 5.0, maxSurfaceSpeed))
+        val speedMs = effectiveSpeedKmh / 3.6
+        val durationSeconds = max(1, (distanceMeters / speedMs).toInt())
 
         // Physical forces
         val fRolling = config.tireRollingCoeff * rollingMultiplier * totalMass * GRAVITY * cos(theta)
@@ -99,16 +143,6 @@ class EBikePhysicsEngine(
                 durationSeconds = durationSeconds,
                 motorWatt = 0,
                 riderWatt = 10
-            )
-        }
-
-        if (assistLevel.motorAssistRatio <= 0.0) {
-            // Motor off
-            return SegmentEnergyResult(
-                energyWh = 0.0,
-                durationSeconds = durationSeconds,
-                motorWatt = 0,
-                riderWatt = min(450.0, powerTotal).toInt()
             )
         }
 
