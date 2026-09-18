@@ -1,50 +1,429 @@
-# Plan: Expose UI affordance for waypoint reordering
+# Implementation Plan: Ride History & Saved/Favorite Routes Persistence
 
-## Investigation summary
+## 1. Executive Summary & Architecture Philosophy
 
-- `BikeMapViewModel.moveWaypoint(fromIdx: Int, toIdx: Int)` (`ui/viewmodel/BikeMapViewModel.kt:151-160`) is fully implemented: removes the waypoint at `fromIdx`, reinserts it at `toIdx`, reindexes letters/labels, and recalculates the route if there are enough valid points.
-- `RoutePlannerSheet` already accepts `onMoveWaypoint: (Int, Int) -> Unit` as a parameter (`ui/components/RoutePlannerSheet.kt:38`), and `MainActivity.kt:362` wires it to `viewModel.moveWaypoint`. So the callback plumbing is complete end-to-end.
-- The gap is purely inside `RoutePlannerSheet`'s composable body: the waypoint list (`ui/components/RoutePlannerSheet.kt:127-211`) renders each `RouteWaypoint` in a plain `Column` of `Row`s built with `forEachIndexed`, with an "Actions" `Row` (lines 187-208) that only has Pick-on-map, Search, and Remove `IconButton`s. `onMoveWaypoint` is never called anywhere in the file — it is dead code from the UI's perspective, exactly as described.
-- The list is rendered inside a `Card` whose content sits in a `Column().verticalScroll(rememberScrollState())` (line 58-62) — the whole sheet, including the waypoint list, profile tabs, route options, and route summary, scrolls as one unit. The waypoint sub-list is a plain `Column`, **not** a `LazyColumn`.
+The application (`com.ebike.router`) is an Android Kotlin/Jetpack Compose navigation and routing app. Its primary architecture philosophy is **normal-bike-first**, featuring an **opt-in e-bike mode** (with battery drain modeling, assist level scaling, and motor wattage physics).
 
-## Recommendation: up/down icon buttons, not drag-and-drop
+Currently, the app has **zero local persistence** — no Room, DataStore, or SharedPreferences. If the user closes the app or finishes a ride, all route computations, waypoints, and ride telemetry disappear immediately.
 
-Add two small `IconButton`s (▲ `Icons.Default.KeyboardArrowUp` / ▼ `Icons.Default.KeyboardArrowDown`) to the existing "Actions" `Row` per waypoint, calling `onMoveWaypoint(idx, idx - 1)` / `onMoveWaypoint(idx, idx + 1)`.
+This document outlines a production-ready implementation plan to introduce local database persistence using **Jetpack Room** and **Kotlin Coroutines / Flow**, covering:
+1. **Ride History Persistence**: Logging completed rides (distance, duration, avg/max speed, elevation gain/loss, polyline path, and optional e-bike metrics).
+2. **Saved / Favorite Routes**: Storing multi-stop itineraries with profile preference, waypoints, and polyline previews.
+3. **Saved / Favorite Destinations**: Storing frequent places (Home, Work, Trails) for 1-tap waypoint selection in search dialogs.
 
-### Why not drag-and-drop
+---
 
-1. **Not a LazyColumn.** The waypoint list is a plain `Column` nested inside an outer `verticalScroll` `Column` that also contains profile tabs, the calculate button, route option cards, and the route summary/elevation chart. Reorderable-list solutions (`LazyColumn` + `Modifier.dragAndDropContainer`, or libraries like `reorderable`/`sh.calvin.reorderable`) are built around `LazyColumn`/`LazyListState` item slots. Adopting one would require carving the waypoint list out into its own `LazyColumn` and restructuring the sheet's scrolling (nested scrollables inside a `verticalScroll` don't compose well — you'd hit the classic "vertical scrollable was measured with an infinite height" class of bugs, or need to give the inner `LazyColumn` a fixed/measured height). That's a structural rewrite of the sheet, not a small addition.
-2. **List is short and same-height rows.** Multi-stop waypoints are typically 2-6 items, all identical fixed-height rows — the classic case where up/down buttons give 90% of the benefit of drag-and-drop for a fraction of the complexity, with no custom gesture/hit-testing code and no new dependency.
-3. **Touch-target risk in a dense row.** Each waypoint row already packs a badge, two lines of text, and 2-3 `IconButton`s (32.dp) into a single `Row` (lines 134-209). A `detectDragGesturesAfterLongPress` handle competing with the row's own `clickable` (opens search, line 169) and the map-pick/search/remove buttons increases the chance of accidental drags or gesture conflicts, especially since the row's whole label area is already tappable.
-4. **Consistent with the file's existing patterns.** The file already expresses "move" semantics via a single button (`onReverseWaypoints`, lines 228-237, bound to `Icons.Default.SwapVert`) rather than any gesture-based interaction. Up/down `IconButton`s match this established idiom and the icon-button-per-action layout already used in the row (lines 188-207).
-5. **No new dependency needed.** `Icons.Default.KeyboardArrowUp`/`KeyboardArrowDown` are already available via the existing `androidx.compose.material.icons.filled.*` import (line 12); no library addition, no gesture-detection code, no semantics/accessibility work for custom drag handles.
+## 2. Dependencies & Build Configuration (`build.gradle.kts`)
 
-### Implementation sketch (not to be done now — investigation only)
-
-In the "Actions" `Row` (`ui/components/RoutePlannerSheet.kt:187-208`), before or after the existing buttons, add:
-
+### 2.1 Root `build.gradle.kts`
+Add the Kotlin Symbol Processing (KSP) plugin matching Kotlin `2.0.21`:
 ```kotlin
-IconButton(
-    onClick = { onMoveWaypoint(idx, idx - 1) },
-    enabled = idx > 0,
-    modifier = Modifier.size(32.dp).background(Slate700, RoundedCornerShape(6.dp))
-) {
-    Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Mover para cima", tint = if (idx > 0) Color.White else Slate700, modifier = Modifier.size(16.dp))
-}
-IconButton(
-    onClick = { onMoveWaypoint(idx, idx + 1) },
-    enabled = idx < waypoints.size - 1,
-    modifier = Modifier.size(32.dp).background(Slate700, RoundedCornerShape(6.dp))
-) {
-    Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Mover para baixo", tint = if (idx < waypoints.size - 1) Color.White else Slate700, modifier = Modifier.size(16.dp))
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
 }
 ```
 
-Notes for the implementer:
-- Guard first/last positions (`idx == 0` disables up, `idx == waypoints.size - 1` disables down) — mirrors the existing `isFirst`/`isLast` booleans already computed at lines 129-130.
-- Row already has 2-3 buttons at 32.dp each plus a flexible label `Column`; adding two more (4-5 total) in a `.size(32.dp)` `Row` with `spacedBy(4.dp)` will get visually tight, especially on narrow devices — worth checking whether the existing Pick-on-map / Search buttons could be dropped to icon-only more compactly, or whether the row needs to shrink other elements, once this is actually implemented.
-- `moveWaypoint` already triggers `calculateRoute()` when valid, so no extra wiring needed beyond calling the existing `onMoveWaypoint` callback — this confirms the callback contract expects simple adjacent-swap style calls, which up/down buttons naturally produce (`idx` ↔ `idx ± 1`), rather than arbitrary drag-drop reordering distances.
+### 2.2 `app/build.gradle.kts`
+Apply the KSP plugin and add Room dependencies:
+```kotlin
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
 
-## If drag-and-drop is wanted later
+dependencies {
+    // Existing:
+    // ...
+    // implementation("com.google.code.gson:gson:2.11.0")
 
-If the product direction shifts toward drag-and-drop (e.g. for longer waypoint lists), the prerequisite refactor is: extract the waypoint list into its own `LazyColumn` with explicit `key = { wp.id }` per item, and either give it a bounded height (e.g. `heightIn(max = ...)`) so it can coexist inside the outer `verticalScroll`, or restructure the sheet so only the waypoint list scrolls independently (removing the outer `verticalScroll` and making the whole `Column` a `LazyColumn` with mixed item types for header/tabs/waypoints/routes/summary). At that point, `detectDragGesturesAfterLongPress` with manual offset tracking, or a small library like `sh.calvin.reorderable`, becomes viable. This is a larger, separate change and not recommended as the first step.
+    // Room Persistence
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+}
+```
+
+---
+
+## 3. Data Model & Room Entities
+
+To respect the **normal-bike-first** principle, all e-bike-specific telemetry fields (such as `energyConsumedWh`, `batteryDrainPercent`, and `assistLevel`) are **nullable**. When a rider completes a regular bike ride, e-bike metrics are `null`, avoiding artificial zero-battery entries.
+
+### 3.1 Entity: `RideHistoryEntity`
+Stores completed or recorded rides.
+
+```kotlin
+package com.ebike.router.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "ride_history")
+data class RideHistoryEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val title: String,                          // e.g. "Pedal Matinal", "Parque Ibirapuera", or custom name
+    val timestampMillis: Long,                  // Start timestamp (System.currentTimeMillis())
+    val distanceMeters: Int,                    // Total distance traveled
+    val durationSeconds: Int,                   // Total elapsed active ride time
+    val avgSpeedKmh: Double,                    // Calculated average speed
+    val maxSpeedKmh: Double,                    // Peak speed recorded
+    val elevationGainM: Int,                    // Total meters climbed
+    val elevationLossM: Int,                    // Total meters descended
+    val routePolyline: String,                  // JSON array or Encoded Polyline (GeoPoint list)
+    val startAddress: String? = null,           // Human-readable origin label
+    val endAddress: String? = null,             // Human-readable destination label
+    
+    // Normal-bike-first vs E-bike opt-in attributes:
+    val isEBikeMode: Boolean = false,           // False for regular acoustic bikes, true if e-bike mode was used
+    val assistLevel: String? = null,            // AssistLevel name (OFF, ECO, TOUR, SPORT, TURBO) or null
+    val energyConsumedWh: Double? = null,       // Wh consumed during ride (null if standard bike)
+    val batteryDrainPercent: Double? = null     // Percentage drain (null if standard bike)
+)
+```
+
+### 3.2 Entity: `SavedRouteEntity`
+Stores complete multi-waypoint itineraries that users want to repeat.
+
+```kotlin
+package com.ebike.router.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+import com.ebike.router.model.RoutingProfile
+
+@Entity(tableName = "saved_routes")
+data class SavedRouteEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val name: String,                           // e.g. "Caminho do Trabalho (Ciclovia)"
+    val profile: RoutingProfile,                // EFFICIENT, TURBO, SCENIC, SAFE
+    val waypointsJson: String,                  // Serialized List<RouteWaypoint>
+    val polylineJson: String,                   // Serialized List<GeoPoint> for immediate rendering
+    val totalDistanceMeters: Int,
+    val totalDurationSeconds: Int,
+    val elevationGainM: Int,
+    val isFavorite: Boolean = true,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
+
+### 3.3 Entity: `SavedDestinationEntity`
+Stores pinned destination points for rapid reuse in the search dialog and main map.
+
+```kotlin
+package com.ebike.router.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+enum class DestinationCategory {
+    HOME, WORK, FAVORITE, TRAIL, POI
+}
+
+@Entity(tableName = "saved_destinations")
+data class SavedDestinationEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val label: String,                          // e.g. "Casa", "Trabalho", "Ciclovia Pinheiros"
+    val subText: String,                        // Address or descriptive text
+    val lat: Double,
+    val lng: Double,
+    val ele: Double = 20.0,
+    val category: DestinationCategory = DestinationCategory.FAVORITE,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
+
+### 3.4 Room Type Converters
+Using the existing Gson library (`com.google.code.gson:gson:2.11.0`):
+- `RoutingProfile` <-> `String`
+- `DestinationCategory` <-> `String`
+- `List<GeoPoint>` <-> `String` (JSON or Google Polyline Algorithm)
+- `List<RouteWaypoint>` <-> `String` (JSON)
+
+---
+
+## 4. DAO & Repository Layer Design
+
+### 4.1 DAOs (`RideHistoryDao`, `SavedRouteDao`, `SavedDestinationDao`)
+
+```kotlin
+package com.ebike.router.data.local.dao
+
+import androidx.room.*
+import com.ebike.router.data.local.entity.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface RideHistoryDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRide(ride: RideHistoryEntity): Long
+
+    @Query("UPDATE ride_history SET title = :newTitle WHERE id = :id")
+    suspend fun renameRide(id: Long, newTitle: String)
+
+    @Delete
+    suspend fun deleteRide(ride: RideHistoryEntity)
+
+    @Query("DELETE FROM ride_history WHERE id = :id")
+    suspend fun deleteRideById(id: Long)
+
+    @Query("SELECT * FROM ride_history ORDER BY timestampMillis DESC")
+    fun getAllRides(): Flow<List<RideHistoryEntity>>
+
+    @Query("SELECT * FROM ride_history WHERE id = :id")
+    suspend fun getRideById(id: Long): RideHistoryEntity?
+}
+
+@Dao
+interface SavedRouteDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRoute(route: SavedRouteEntity): Long
+
+    @Query("UPDATE saved_routes SET name = :newName WHERE id = :id")
+    suspend fun renameRoute(id: Long, newName: String)
+
+    @Query("UPDATE saved_routes SET isFavorite = :isFav WHERE id = :id")
+    suspend fun setFavorite(id: Long, isFav: Boolean)
+
+    @Query("DELETE FROM saved_routes WHERE id = :id")
+    suspend fun deleteRouteById(id: Long)
+
+    @Query("SELECT * FROM saved_routes ORDER BY createdAtMillis DESC")
+    fun getAllSavedRoutes(): Flow<List<SavedRouteEntity>>
+}
+
+@Dao
+interface SavedDestinationDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDestination(destination: SavedDestinationEntity): Long
+
+    @Query("UPDATE saved_destinations SET label = :newLabel WHERE id = :id")
+    suspend fun renameDestination(id: Long, newLabel: String)
+
+    @Query("DELETE FROM saved_destinations WHERE id = :id")
+    suspend fun deleteDestinationById(id: Long)
+
+    @Query("SELECT * FROM saved_destinations ORDER BY createdAtMillis DESC")
+    fun getAllDestinations(): Flow<List<SavedDestinationEntity>>
+}
+```
+
+### 4.2 Room Database (`AppDatabase`)
+```kotlin
+@Database(
+    entities = [
+        RideHistoryEntity::class,
+        SavedRouteEntity::class,
+        SavedDestinationEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(RoomConverters::class)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun rideHistoryDao(): RideHistoryDao
+    abstract fun savedRouteDao(): SavedRouteDao
+    abstract fun savedDestinationDao(): SavedDestinationDao
+
+    companion object {
+        @Volatile private var INSTANCE: AppDatabase? = null
+        fun getInstance(context: Context): AppDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "bike_router.db"
+                ).build().also { INSTANCE = it }
+            }
+    }
+}
+```
+
+### 4.3 Repository Interface & Implementation (`BikeRepository`)
+A unified repository decoupling Room entities from UI ViewModels:
+- `val allRides: Flow<List<RideHistoryEntity>>`
+- `val savedRoutes: Flow<List<SavedRouteEntity>>`
+- `val savedDestinations: Flow<List<SavedDestinationEntity>>`
+- `suspend fun saveRide(ride: RideHistoryEntity): Long`
+- `suspend fun renameRide(id: Long, title: String)`
+- `suspend fun deleteRide(id: Long)`
+- `suspend fun saveRoute(name: String, route: RouteResult, waypoints: List<RouteWaypoint>): Long`
+- `suspend fun deleteRoute(id: Long)`
+- `suspend fun renameRoute(id: Long, newName: String)`
+- `suspend fun saveDestination(label: String, point: GeoPoint, address: String, category: DestinationCategory)`
+- `suspend fun deleteDestination(id: Long)`
+
+---
+
+## 5. ViewModel Integration & State Machine Hooks
+
+`BikeMapViewModel` is the single source of truth for the map UI and navigation state. Below are the precise locations to hook save/load operations:
+
+### 5.1 Repository Initialization
+In `BikeMapViewModel(application: Application)`:
+```kotlin
+private val database = AppDatabase.getInstance(application)
+val repository: BikeRepository = BikeRepositoryImpl(
+    database.rideHistoryDao(),
+    database.savedRouteDao(),
+    database.savedDestinationDao()
+)
+
+// Expose observable state flows to Compose UI
+val rideHistory = repository.allRides.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedRoutes = repository.savedRoutes.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedDestinations = repository.savedDestinations.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+```
+
+### 5.2 Hook 1: Ride Completion & Auto-Save Prompt
+Currently, in `BikeMapViewModel.kt`:
+- `handleRiderLocationUpdate` checks `if (distToManeuver <= 15)` on the last instruction and calls `stopNavigation()`.
+- `stopNavigation()` immediately sets `_isNavigating.value = false` and cancels `rideTimerJob`, discarding all telemetry.
+
+**Proposed Hook**:
+1. Introduce a state `val completedRideSummary = MutableStateFlow<RideHistoryEntity?>(null)`.
+2. Introduce a session start timestamp `rideStartTime: Long = 0L` initialized when `startNavigation()` is called.
+3. Update `stopNavigation(savePrompt: Boolean = true)`:
+   - Check if ride was substantive (e.g. `distanceRiddenKm >= 0.05` or `timeElapsedSeconds >= 20`) to avoid saving accidental 2-second clicks.
+   - If substantive and `savePrompt == true`:
+     - Construct a `RideHistoryEntity` from `telemetry.value` and `activeRoute.value`.
+     - Determine `isEBikeMode`: check whether motor assist was enabled (`activeAssist != AssistLevel.OFF`) or battery telemetry is active. For regular bike mode, set `energyConsumedWh = null` and `batteryDrainPercent = null`.
+     - Assign `completedRideSummary.value = summaryEntity`.
+     - This triggers a Compose dialog: "Pedal Finalizado! Deseja salvar?".
+     - If user clicks "Salvar", call `viewModelScope.launch { repository.saveRide(...) }`.
+     - If user clicks "Descartar", reset `completedRideSummary.value = null`.
+
+### 5.3 Hook 2: Saving the Active Route
+In `RoutePlannerSheet`:
+1. When `activeRoute.value != null`, the user can tap a "Salvar Rota" / Bookmark button.
+2. ViewModel method:
+```kotlin
+fun saveCurrentRoute(customName: String? = null) {
+    val route = activeRoute.value ?: return
+    val wps = _waypoints.value
+    viewModelScope.launch {
+        repository.saveRoute(
+            name = customName ?: route.name,
+            route = route,
+            waypoints = wps
+        )
+    }
+}
+```
+
+### 5.4 Hook 3: Loading a Saved Route
+When the user taps a saved route from the Saved Routes list:
+1. ViewModel method:
+```kotlin
+fun loadSavedRoute(savedRoute: SavedRouteEntity) {
+    val decodedWaypoints = deserializeWaypoints(savedRoute.waypointsJson)
+    _waypoints.value = decodedWaypoints
+    _selectedProfile.value = savedRoute.profile
+    showRoutePlannerSheet.value = true
+    calculateRoute() // Recalculate route for up-to-date traffic/profile
+}
+```
+
+### 5.5 Hook 4: Saving & Loading Favorite Destinations
+1. **In `WaypointSearchDialog`**:
+   - Above the search results or when query is blank, display `savedDestinations` chips ("🏠 Casa", "💼 Trabalho", "⭐ Favoritos").
+   - Tapping a chip immediately invokes `setWaypoint(targetIndex, destination.point, destination.label)` and dismisses the dialog.
+   - On search result items, add a Star/Bookmark icon: tapping it invokes `repository.saveDestination(...)`.
+2. **In Map Tap Dialog (`showMapClickMenuForPoint`)**:
+   - Add a "+ Salvar como Favorito" button to persist the tapped point.
+
+---
+
+## 6. UI Touchpoints & User Experience Flow
+
+```
++-------------------------------------------------------------------------+
+| Top Bar: [ 🔍 Para onde vamos pedalar? ]  [ ⭐ Salvos & Histórico ] [ 🔋 90% ] |
++-------------------------------------------------------------------------+
+                                    |
+                                    v Opens
++-------------------------------------------------------------------------+
+|                  MODAL / SHEET: HISTÓRICO & SALVOS                      |
+|  [ TAB 1: HISTÓRICO ]   [ TAB 2: ROTAS SALVAS ]   [ TAB 3: FAVORITOS ]  |
+|                                                                         |
+|  • 17/09/2026 - Pedal Noturno (Normal Bike)                             |
+|    📏 14.2 km • ⏱️ 38 min • ⚡ 22.4 km/h • ▲ 120m                      |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
+|                                                                         |
+|  • 15/09/2026 - Rota Parque (E-Bike • ECO)                              |
+|    📏 28.5 km • ⏱️ 55 min • ⚡ 31.0 km/h • 🔋 -42 Wh (6.7%)            |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
++-------------------------------------------------------------------------+
+```
+
+### 6.1 UI Entry Points
+1. **Top Bar in `MainActivity.kt`**:
+   - Insert an IconButton or Pill next to Search and Cockpit: `Icons.Default.Bookmark` / `Icons.Default.History` ("Histórico & Salvos").
+   - Controls state `showHistoryDialog: MutableStateFlow<Boolean>`.
+2. **Post-Ride Summary Dialog (`RideSummaryDialog`)**:
+   - Appears immediately upon arriving at the destination or ending navigation.
+   - Shows summary statistics card:
+     - Distance, duration, avg speed, elevation.
+     - Mode badge: "Bicicleta Convencional" vs "E-Bike (Tour/Eco)".
+   - Editable `OutlinedTextField` for custom ride title (prefilled with e.g. "Pedal em [Data]").
+   - Action buttons: "Salvar no Histórico" (EmeraldGreen) vs "Descartar" (Slate700).
+3. **History & Saved Sheet (`RideHistorySheet.kt`)**:
+   - **Tab 1: Histórico de Pedais**:
+     - `LazyColumn` of ride cards sorted by timestamp descending.
+     - Distinguishes standard bike vs e-bike visually.
+     - Swipe-to-delete or delete icon button with `ConfirmDeleteDialog`.
+     - Rename icon button opening `RenameDialog`.
+     - "Repetir no Mapa": loads the polyline on the map for viewing.
+   - **Tab 2: Rotas Salvas**:
+     - List of saved itineraries with profile tags, distance, and duration.
+     - "Navegar Agora": populates waypoints and opens planner.
+     - Rename / Delete options.
+   - **Tab 3: Locais Favoritos**:
+     - List of saved locations (Home, Work, custom).
+     - "Ir para cá": sets destination waypoint.
+4. **Integration into `WaypointSearchDialog.kt`**:
+   - Quick Favorites Row displayed when search query is empty.
+   - Bookmark icon on each search result item to save directly into favorites.
+5. **Integration into `RoutePlannerSheet.kt`**:
+   - A "Salvar Rota" button placed on the active route preview card.
+
+---
+
+## 7. Step-by-Step Implementation Roadmap
+
+| Step | Scope | Description |
+| :--- | :--- | :--- |
+| **Phase 1** | Gradle Setup | Add KSP plugin to root and app `build.gradle.kts`, add `androidx.room` runtime, ktx, and compiler dependencies. |
+| **Phase 2** | Local Data Layer | Implement `RideHistoryEntity`, `SavedRouteEntity`, `SavedDestinationEntity`, Room type converters, DAOs, and `AppDatabase`. |
+| **Phase 3** | Repository Layer | Create `BikeRepository` interface and `BikeRepositoryImpl` managing coroutines on `Dispatchers.IO`. |
+| **Phase 4** | ViewModel Hooks | Inject repository into `BikeMapViewModel`. Wire navigation completion to `completedRideSummary`, add save/load/rename/delete methods. |
+| **Phase 5** | UI Components | Create `RideHistorySheet`, `RideSummaryDialog`, `RenameDialog`, and `ConfirmDeleteDialog`. |
+| **Phase 6** | Search & Planner UI | Integrate favorite destinations row into `WaypointSearchDialog` and "Salvar Rota" into `RoutePlannerSheet`. |
+| **Phase 7** | Verification | Test normal bike rides (no battery data saved), e-bike rides (battery data saved), database migrations, route loading, and deletion. |
+
+---
+
+## 8. Verification & Edge Cases
+
+1. **Normal Bike Mode Integrity**:
+   - Verify that rides performed with regular bike settings have `isEBikeMode = false` and `energyConsumedWh = null`, ensuring the UI cleanly hides battery cards.
+2. **Zero-Distance / Accidental Clicks**:
+   - Guard `completedRideSummary` against short aborts (< 50 meters or < 15 seconds) so database is not polluted.
+3. **Database Versioning & Migration**:
+   - Initial version `version = 1`. If schema evolves, specify clean Room migrations or `fallbackToDestructiveMigration()` during development.
+4. **Polyline Compression**:
+   - Store polylines as Google Polyline Algorithm encoded strings (or serialized coordinate JSON) to avoid large payload overhead in SQLite.

@@ -68,10 +68,12 @@ class EBikePhysicsEngine(
         distanceMeters: Double,
         gradePercent: Double,
         targetSpeedKmh: Double,
-        assistLevel: AssistLevel = config.activeAssist
+        assistLevel: AssistLevel = config.activeAssist,
+        rollingMultiplier: Double = 1.0
     ): SegmentEnergyResult {
-        // Cap speed based on assist limit or slope (CONTRAN 996/2023: max 32 km/h assist)
-        val effectiveSpeedKmh = max(5.0, min(assistLevel.maxSpeedKmh + 5.0, targetSpeedKmh))
+        // Cap speed based on assist limit, slope and surface roughness (CONTRAN 996/2023: max 32 km/h assist)
+        val maxSurfaceSpeed = if (rollingMultiplier > 1.4) min(targetSpeedKmh, 22.0) else targetSpeedKmh
+        val effectiveSpeedKmh = max(5.0, min(assistLevel.maxSpeedKmh + 5.0, maxSurfaceSpeed))
         val speedMs = effectiveSpeedKmh / 3.6
         val durationSeconds = max(1, (distanceMeters / speedMs).toInt())
 
@@ -79,7 +81,7 @@ class EBikePhysicsEngine(
         val theta = atan(gradePercent / 100.0)
 
         // Physical forces
-        val fRolling = config.tireRollingCoeff * totalMass * GRAVITY * cos(theta)
+        val fRolling = config.tireRollingCoeff * rollingMultiplier * totalMass * GRAVITY * cos(theta)
         val fGravity = totalMass * GRAVITY * sin(theta)
         val fAero = 0.5 * AIR_DENSITY * config.aerodynamicCdA * speedMs.pow(2)
 
