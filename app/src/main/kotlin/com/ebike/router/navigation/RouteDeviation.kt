@@ -22,7 +22,8 @@ object RouteDeviation {
         point: GeoPoint,
         routeCoordinates: List<GeoPoint>,
         searchAroundIndex: Int? = null,
-        windowSize: Int = 30
+        windowSize: Int = 30,
+        fallbackThresholdMeters: Double = 100.0
     ): NearestPointResult? {
         if (routeCoordinates.size < 2) return null
 
@@ -32,7 +33,9 @@ object RouteDeviation {
             if (from <= to) scanSegments(point, routeCoordinates, from, to) else null
         }
 
-        if (windowed != null) return windowed
+        if (windowed != null && windowed.distanceMeters <= fallbackThresholdMeters) {
+            return windowed
+        }
 
         return scanSegments(point, routeCoordinates, 0, routeCoordinates.size - 2)
     }
@@ -42,9 +45,10 @@ object RouteDeviation {
         point: GeoPoint,
         routeCoordinates: List<GeoPoint>,
         searchAroundIndex: Int? = null,
-        windowSize: Int = 30
+        windowSize: Int = 30,
+        fallbackThresholdMeters: Double = 100.0
     ): Double {
-        return findNearestPointOnRoute(point, routeCoordinates, searchAroundIndex, windowSize)
+        return findNearestPointOnRoute(point, routeCoordinates, searchAroundIndex, windowSize, fallbackThresholdMeters)
             ?.distanceMeters ?: Double.MAX_VALUE
     }
 
