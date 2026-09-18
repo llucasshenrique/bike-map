@@ -227,7 +227,7 @@ class OfflineTileCacheService {
             } finally {
                 writer.onDetach()
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             0L
         }
     }
@@ -241,7 +241,7 @@ class OfflineTileCacheService {
             } finally {
                 writer.onDetach()
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             false
         }
     }
