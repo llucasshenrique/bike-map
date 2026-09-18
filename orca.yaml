@@ -1,0 +1,44 @@
+# Orca repo config (https://orca app -> repo settings reads/writes this file).
+# Schema: scripts.setup/archive run on `orca worktree create` / `orca worktree rm`.
+# worktree.sharedDirectories are symlinked into new worktrees instead of copied.
+
+scripts:
+  setup: |
+    # Auto-trust this new worktree in Antigravity CLI
+    CONFIG_FILE="$HOME/.gemini/antigravity-cli/settings.json"
+    if command -v jq > /dev/null 2>&1; then
+      mkdir -p "$(dirname "$CONFIG_FILE")"
+      if [ ! -s "$CONFIG_FILE" ] || ! jq empty "$CONFIG_FILE" > /dev/null 2>&1; then
+        echo '{}' > "$CONFIG_FILE"
+      fi
+      TARGET_PWD="$PWD"
+      REAL_PWD="$(pwd -P 2>/dev/null || echo "$PWD")"
+      TMP_FILE="${CONFIG_FILE}.tmp.$$$RANDOM"
+      jq --arg pwd "$TARGET_PWD" --arg real "$REAL_PWD" '
+        .trustedWorkspaces = (
+          (if (.trustedWorkspaces | type) == "array" then .trustedWorkspaces else [] end)
+          | (if index($pwd) then . else . + [$pwd] end)
+          | (if index($real) then . else . + [$real] end)
+        )
+      ' "$CONFIG_FILE" > "$TMP_FILE" && chmod 600 "$TMP_FILE" 2>/dev/null && mv "$TMP_FILE" "$CONFIG_FILE"
+    fi
+
+  archive: |
+    # Remove this worktree from Antigravity CLI trusted workspaces upon deletion
+    CONFIG_FILE="$HOME/.gemini/antigravity-cli/settings.json"
+    if [ -s "$CONFIG_FILE" ] && command -v jq > /dev/null 2>&1; then
+      TARGET_PWD="$PWD"
+      REAL_PWD="$(pwd -P 2>/dev/null || echo "$PWD")"
+      TMP_FILE="${CONFIG_FILE}.tmp.$$$RANDOM"
+      jq --arg pwd "$TARGET_PWD" --arg real "$REAL_PWD" '
+        .trustedWorkspaces = (
+          (if (.trustedWorkspaces | type) == "array" then .trustedWorkspaces else [] end) - [$pwd, $real]
+        )
+      ' "$CONFIG_FILE" > "$TMP_FILE" && chmod 600 "$TMP_FILE" 2>/dev/null && mv "$TMP_FILE" "$CONFIG_FILE"
+    fi
+
+# Hold tab-opening / agent startup / other worktree actions until setup has finished
+setupAgentStartupPolicy: wait-for-setup
+
+worktree:
+  sharedDirectories:
