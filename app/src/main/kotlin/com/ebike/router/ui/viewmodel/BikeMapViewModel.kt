@@ -59,7 +59,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     )
 
     val physicsEngine = EBikePhysicsEngine()
-    val routerService = GraphRouterService(physicsEngine)
+    val routerService = GraphRouterService(physicsEngine, application)
     val geocodingService = GeocodingService()
     val audioGuidance = AudioGuidanceService(application)
 
