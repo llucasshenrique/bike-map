@@ -79,7 +79,8 @@ class EBikePhysicsEngine(
         distanceMeters: Double,
         gradePercent: Double,
         targetSpeedKmh: Double,
-        assistLevel: AssistLevel = config.activeAssist
+        assistLevel: AssistLevel = config.activeAssist,
+        rollingMultiplier: Double = 1.0
     ): SegmentEnergyResult {
         val totalMass = config.bikeWeightKg + config.riderWeightKg
         val theta = atan(gradePercent / 100.0)
@@ -91,7 +92,7 @@ class EBikePhysicsEngine(
             val effectiveSpeedKmh = if (gradePercent > 0.0) {
                 // On inclines, speed naturally drops based on gravity & rolling resistance: v = P / F
                 val fGravity = totalMass * GRAVITY * sin(theta)
-                val fRolling = config.tireRollingCoeff * totalMass * GRAVITY * cos(theta)
+                val fRolling = config.tireRollingCoeff * rollingMultiplier * totalMass * GRAVITY * cos(theta)
                 val fResistance = fGravity + fRolling
                 val climbSpeedMs = if (fResistance > 0) humanPowerWatts / fResistance else 5.0
                 val calculatedKmh = climbSpeedMs * 3.6
@@ -103,7 +104,7 @@ class EBikePhysicsEngine(
             val speedMs = effectiveSpeedKmh / 3.6
             val durationSeconds = max(1, (distanceMeters / speedMs).toInt())
 
-            val fRolling = config.tireRollingCoeff * totalMass * GRAVITY * cos(theta)
+            val fRolling = config.tireRollingCoeff * rollingMultiplier * totalMass * GRAVITY * cos(theta)
             val fGravity = totalMass * GRAVITY * sin(theta)
             val fAero = 0.5 * AIR_DENSITY * config.aerodynamicCdA * speedMs.pow(2)
             val powerTotal = (fRolling + fGravity + fAero) * speedMs
@@ -117,13 +118,14 @@ class EBikePhysicsEngine(
         }
 
         // Motor assisted cycling
+        val maxSurfaceSpeed = if (rollingMultiplier > 1.4) min(targetSpeedKmh, 22.0) else targetSpeedKmh
         val maxSpeedLimit = min(assistLevel.maxSpeedKmh, config.maxAssistSpeedKmh)
-        val effectiveSpeedKmh = max(5.0, min(maxSpeedLimit + 5.0, targetSpeedKmh))
+        val effectiveSpeedKmh = max(5.0, min(maxSpeedLimit + 5.0, maxSurfaceSpeed))
         val speedMs = effectiveSpeedKmh / 3.6
         val durationSeconds = max(1, (distanceMeters / speedMs).toInt())
 
         // Physical forces
-        val fRolling = config.tireRollingCoeff * totalMass * GRAVITY * cos(theta)
+        val fRolling = config.tireRollingCoeff * rollingMultiplier * totalMass * GRAVITY * cos(theta)
         val fGravity = totalMass * GRAVITY * sin(theta)
         val fAero = 0.5 * AIR_DENSITY * config.aerodynamicCdA * speedMs.pow(2)
 

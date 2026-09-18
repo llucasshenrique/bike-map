@@ -1,343 +1,429 @@
-# Implementation Plan: Explicit Opt-In E-Bike Mode & Bike Specs Configuration
+# Implementation Plan: Ride History & Saved/Favorite Routes Persistence
 
-## 1. Executive Summary & Problem Analysis
+## 1. Executive Summary & Architecture Philosophy
 
-### 1.1 Context & Core Philosophy
-The application (`com.ebike.router`) is a 100% native Android app built with Kotlin, Jetpack Compose, and Osmdroid. While it includes mathematical bicycle physics modeling (`EBikePhysicsEngine.kt`), **the app has no hardware or Bluetooth Low Energy (BLE) connection to any real bicycle or motor controller**. All battery consumption, remaining range, motor power, and rider leg effort figures are purely simulated estimates calculated on-device.
+The application (`com.ebike.router`) is an Android Kotlin/Jetpack Compose navigation and routing app. Its primary architecture philosophy is **normal-bike-first**, featuring an **opt-in e-bike mode** (with battery drain modeling, assist level scaling, and motor wattage physics).
 
-Furthermore, the product vision is **normal-bike-first**. A regular cyclist should be able to open the app, plan routes, and navigate without encountering battery percentages, motor assist selectors, or e-bike jargon. Cyclists who do ride an e-bike must be able to **explicitly opt in**, specify their bicycle's actual physical parameters, and see assist-aware range and ETA predictions—**transparently and unequivocally labeled as "estimated, not measured"**.
+Currently, the app has **zero local persistence** — no Room, DataStore, or SharedPreferences. If the user closes the app or finishes a ride, all route computations, waypoints, and ride telemetry disappear immediately.
 
-### 1.2 Current Architectural Deficiencies
-1. **Zero Persistence Layer**: There is currently no `DataStore`, `SharedPreferences`, or database. All state resets to hardcoded constants on app restart (`EBikeConfig(batteryCapacityWh = 625.0, bikeWeightKg = 24.0, ...)`).
-2. **Missing Settings / Preferences UI**: There is no settings screen, menu, or dialog to configure bike type or ride parameters.
-3. **Pervasive E-Bike Bias in UI**:
-   - `MainActivity.kt`: Top floating bar displays an e-bike icon, battery %, and assist mode button by default.
-   - `RoutePlannerSheet.kt`: Displays "Planejador E-Bike", "CALCULAR ROTA E-BIKE", and "-XX Wh" battery drain unconditionally.
-   - `NavigationHud.kt`: Displays assist level ("Assistência: TOUR") and battery % during navigation.
-   - `TelemetryCockpitDialog.kt`: Features motor power (W), rider power (W), battery % and voltage, and assist level selectors.
-   - `AudioGuidanceService.kt` / `GraphRouterService.kt`: Prompt says: *"Subida íngreme à frente! Aumente o nível de assistência"*.
-4. **Fabricated Telemetry Presented as Fact**:
-   - In `BikeMapViewModel.kt` (lines 331–332):
-     ```kotlin
-     motorPowerWatts = (speed * 10).coerceAtMost(physicsEngine.getConfig().motorMaxWatt).toInt(),
-     riderPowerWatts = (speed * 6).coerceAtLeast(40.0).toInt(),
-     ```
-     These power values are computed directly from GPS speed with arbitrary scalar multipliers, yet presented in the Cockpit and HUD as if they were live telemetry measurements from motor shunts and strain-gauge power meters.
+This document outlines a production-ready implementation plan to introduce local database persistence using **Jetpack Room** and **Kotlin Coroutines / Flow**, covering:
+1. **Ride History Persistence**: Logging completed rides (distance, duration, avg/max speed, elevation gain/loss, polyline path, and optional e-bike metrics).
+2. **Saved / Favorite Routes**: Storing multi-stop itineraries with profile preference, waypoints, and polyline previews.
+3. **Saved / Favorite Destinations**: Storing frequent places (Home, Work, Trails) for 1-tap waypoint selection in search dialogs.
 
 ---
 
-## 2. Target Architecture & Component Matrix
+## 2. Dependencies & Build Configuration (`build.gradle.kts`)
 
-```
-                      +------------------------------------------+
-                      |   Jetpack DataStore Preferences          |
-                      |   (UserPreferencesRepository)            |
-                      +--------------------+---------------------+
-                                           |
-                               Flow<BikePreferences>
-                                           v
-                      +------------------------------------------+
-                      |          BikeMapViewModel                |
-                      |   - isEBikeMode: StateFlow<Boolean>      |
-                      |   - bikeConfig: StateFlow<EBikeConfig>   |
-                      |   - telemetry: StateFlow<LiveRide... >   |
-                      +--------------------+---------------------+
-                                           |
-                +--------------------------+--------------------------+
-                |                                                     |
-                v                                                     v
-   [ E-Bike Mode = FALSE (Default) ]                    [ E-Bike Mode = TRUE (Opt-In) ]
-   - Standard cycling ETA (no motor assist)             - Assist-aware ETA & route energy
-   - Hide battery % and Wh drain                        - User-entered specs (Wh, max km/h, kg)
-   - Hide motor power cards & assist selectors          - Labeled "Estimated, not measured"
-   - Pure bike computer cockpit (speed, dist, elev)     - Simulated motor & rider power estimates
-   - "Planejador de Rotas" / "CALCULAR ROTA"            - "Planejador E-Bike" / Battery telemetry
-```
-
-### Component Impact Overview
-
-| Component | Current State | Normal Bike Mode (Default) | E-Bike Mode (Opt-In) |
-| :--- | :--- | :--- | :--- |
-| **`app/build.gradle.kts`** | No persistence dependency | Add `androidx.datastore:datastore-preferences` | Same |
-| **`model/EBikeModels.kt`** | Static e-bike config & telemetry models | Models distinguish e-bike telemetry vs normal bike telemetry | Add labels/flags indicating simulated estimates |
-| **`physics/EBikePhysicsEngine.kt`** | Always applies motor assist ratios & 32 km/h assist caps | Disabled/bypassed for ETA calculations; standard human pedaling model | Uses user's real specs (`batteryCapacityWh`, `maxSpeedKmh`, `weight`) |
-| **`service/GraphRouterService.kt`** | Hardcodes e-bike cruising speeds & Wh drain | Calculates ETA using human cyclist speeds (~18–22 km/h); zero Wh drain | Calculates assist-aware cruising speeds; computes Wh drain from user specs |
-| **`service/AudioGuidanceService.kt`** | Mentions increasing motor assist on hills | Climb prompt: *"Subida íngreme à frente! Reduza as marchas"* | Climb prompt: *"Subida íngreme à frente! Ajuste o nível de assistência"* |
-| **`ui/viewmodel/BikeMapViewModel.kt`** | Fabricates `motorPowerWatts = speed * 10` | Motor power = 0 / hidden; battery telemetry null; standard ETA | Physics-based power estimate, explicitly tagged as simulated estimate |
-| **`ui/components/SettingsDialog.kt`** | *Does not exist* | **NEW**: Toggle switch (Default: OFF), unit preferences | Expandable form: Battery Wh, Max Assist km/h, Bike kg, Rider kg |
-| **`ui/components/TelemetryCockpitDialog.kt`** | Presents simulated motor & battery as live | Pure digital bike computer (Speed, Dist, Elev, Time); hides motor & battery | Shows motor/battery cards with prominent **"ESTIMATED, NOT MEASURED"** labels |
-| **`NavigationHud.kt`** | Shows assist mode & battery % | Hides assist level & battery; shows trip stats (elev gain, distance) | Shows assist level & battery with explicit `(est.)` tag and disclaimer |
-| **`MainActivity.kt`** | Top bar has battery pill; no settings button | Settings gear button in top bar; hides battery pill | Shows battery pill with `EST.` badge; opens Settings via gear button |
-| **`RoutePlannerSheet.kt`** | "Planejador E-Bike" & Wh drain badges | "Planejador de Rotas", hides Wh drain, shows standard cycling duration | "Planejador E-Bike", shows estimated Wh drain & battery % impact |
-
----
-
-## 3. Detailed Implementation Phases
-
-### Phase 1: Persistence Layer & Domain Models
-
-#### 1.1 Dependency Configuration
-Add Jetpack DataStore Preferences to `app/build.gradle.kts`:
+### 2.1 Root `build.gradle.kts`
+Add the Kotlin Symbol Processing (KSP) plugin matching Kotlin `2.0.21`:
 ```kotlin
-implementation("androidx.datastore:datastore-preferences:1.1.2")
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+}
 ```
 
-#### 1.2 Data Store Repository: `BikePreferencesRepository.kt`
-Create `com.ebike.router.data.BikePreferencesRepository` encapsulating:
-- Preference Keys:
-  - `KEY_IS_EBIKE_MODE` (`Boolean`, default: `false`)
-  - `KEY_BATTERY_CAPACITY_WH` (`Double`, default: `500.0`)
-  - `KEY_CURRENT_BATTERY_WH` (`Double`, default: `500.0`)
-  - `KEY_MAX_ASSIST_SPEED_KMH` (`Double`, default: `32.0`)
-  - `KEY_BIKE_WEIGHT_KG` (`Double`, default: `24.0`)
-  - `KEY_RIDER_WEIGHT_KG` (`Double`, default: `75.0`)
-  - `KEY_REGENERATIVE_BRAKING` (`Boolean`, default: `false`)
-- Data class `UserBikePreferences`:
-  ```kotlin
-  data class UserBikePreferences(
-      val isEBikeMode: Boolean = false,
-      val batteryCapacityWh: Double = 500.0,
-      val currentBatteryWh: Double = 500.0,
-      val maxAssistSpeedKmh: Double = 32.0,
-      val bikeWeightKg: Double = 24.0,
-      val riderWeightKg: Double = 75.0,
-      val regenerativeBraking: Boolean = false
-  )
-  ```
-- Reactive Flow: `val bikePreferencesFlow: Flow<UserBikePreferences>`
-- Mutations: `suspend fun updateEBikeMode(enabled: Boolean)`, `suspend fun updateBikeSpecs(...)`, `suspend fun updateCurrentBatteryWh(...)`.
+### 2.2 `app/build.gradle.kts`
+Apply the KSP plugin and add Room dependencies:
+```kotlin
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
 
-#### 1.3 Update Models: `model/EBikeModels.kt`
-- Introduce a clear telemetry source discriminator:
-  ```kotlin
-  enum class TelemetryOrigin {
-      SIMULATED_ESTIMATE,
-      GPS_MEASURED
-  }
-  ```
-- Add metadata to `LiveRideTelemetry`:
-  - `val isEBikeMode: Boolean = false`
-  - `val isPowerEstimated: Boolean = true` (never presented as measured sensor data)
-  - `val batteryTelemetry: BatteryTelemetry? = null` (nullable; `null` when normal bike mode is active)
+dependencies {
+    // Existing:
+    // ...
+    // implementation("com.google.code.gson:gson:2.11.0")
+
+    // Room Persistence
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+}
+```
 
 ---
 
-### Phase 2: Physics Engine & Routing Services Adaptation
+## 3. Data Model & Room Entities
 
-#### 2.1 Update `physics/EBikePhysicsEngine.kt`
-- Support syncing configuration directly from `UserBikePreferences`.
-- Ensure segment calculations distinguish between unassisted cycling and assisted cycling:
-  - When assist level is `AssistLevel.OFF` (or e-bike mode is disabled):
-    - Motor power = 0 W.
-    - Segment speed calculation models human sustained aerobic output (e.g. 150 W) on slopes, naturally slowing on hills ($v = P_{\text{rider}} / F_{\text{total}}$), rather than maintaining artificial cruising speeds.
-    - Energy consumed = 0.0 Wh.
+To respect the **normal-bike-first** principle, all e-bike-specific telemetry fields (such as `energyConsumedWh`, `batteryDrainPercent`, and `assistLevel`) are **nullable**. When a rider completes a regular bike ride, e-bike metrics are `null`, avoiding artificial zero-battery entries.
 
-#### 2.2 Update `service/GraphRouterService.kt`
-- Update `calculateMultipleRoutes` to receive `isEBikeMode: Boolean` (or `UserBikePreferences`):
-  - **In Normal Bike Mode (`isEBikeMode == false`)**:
-    - Cruising speeds: 18.0 km/h (Safe), 22.0 km/h (Flat/Efficient), with slope-based speed degradation ($10\text{--}14\text{ km/h}$ on climbs $>5\%$).
-    - `totalEnergyWh = 0.0`, `batteryDrainPercent = 0.0`, `estimatedBatteryRemainingWh = 0`.
-    - Turn instructions for climbs: do not instruct user to adjust assist.
-  - **In E-Bike Mode (`isEBikeMode == true`)**:
-    - Cruising speeds: capped at user's `maxAssistSpeedKmh` (e.g. 25 km/h or 32 km/h).
-    - Energy calculation: computes energy based on user's entered total mass (`bikeWeightKg + riderWeightKg`) and battery capacity (`batteryCapacityWh`).
+### 3.1 Entity: `RideHistoryEntity`
+Stores completed or recorded rides.
 
-#### 2.3 Update `service/AudioGuidanceService.kt`
-- Parameterize or branch climb announcements based on e-bike mode:
-  - E-bike mode on: *"Subida íngreme à frente! Ajuste o nível de assistência se necessário."*
-  - E-bike mode off: *"Subida íngreme à frente! Reduza a marcha."*
+```kotlin
+package com.ebike.router.data.local.entity
 
----
+import androidx.room.Entity
+import androidx.room.PrimaryKey
 
-### Phase 3: ViewModel Refactoring (`ui/viewmodel/BikeMapViewModel.kt`)
+@Entity(tableName = "ride_history")
+data class RideHistoryEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val title: String,                          // e.g. "Pedal Matinal", "Parque Ibirapuera", or custom name
+    val timestampMillis: Long,                  // Start timestamp (System.currentTimeMillis())
+    val distanceMeters: Int,                    // Total distance traveled
+    val durationSeconds: Int,                   // Total elapsed active ride time
+    val avgSpeedKmh: Double,                    // Calculated average speed
+    val maxSpeedKmh: Double,                    // Peak speed recorded
+    val elevationGainM: Int,                    // Total meters climbed
+    val elevationLossM: Int,                    // Total meters descended
+    val routePolyline: String,                  // JSON array or Encoded Polyline (GeoPoint list)
+    val startAddress: String? = null,           // Human-readable origin label
+    val endAddress: String? = null,             // Human-readable destination label
+    
+    // Normal-bike-first vs E-bike opt-in attributes:
+    val isEBikeMode: Boolean = false,           // False for regular acoustic bikes, true if e-bike mode was used
+    val assistLevel: String? = null,            // AssistLevel name (OFF, ECO, TOUR, SPORT, TURBO) or null
+    val energyConsumedWh: Double? = null,       // Wh consumed during ride (null if standard bike)
+    val batteryDrainPercent: Double? = null     // Percentage drain (null if standard bike)
+)
+```
 
-#### 3.1 Preferences Binding
-- Inject/instantiate `BikePreferencesRepository(application)`.
-- Expose state flows:
-  - `val bikePreferences: StateFlow<UserBikePreferences>`
-  - `val isEBikeMode: StateFlow<Boolean>`
-- Update `physicsEngine` dynamically when preferences change:
-  ```kotlin
-  viewModelScope.launch {
-      bikePreferencesRepo.bikePreferencesFlow.collect { prefs ->
-          physicsEngine.updateConfig(
-              EBikeConfig(
-                  batteryCapacityWh = prefs.batteryCapacityWh,
-                  currentBatteryWh = prefs.currentBatteryWh,
-                  bikeWeightKg = prefs.bikeWeightKg,
-                  riderWeightKg = prefs.riderWeightKg,
-                  motorMaxWatt = 350.0,
-                  activeAssist = if (prefs.isEBikeMode) physicsEngine.getConfig().activeAssist else AssistLevel.OFF
-              )
-          )
-      }
-  }
-  ```
+### 3.2 Entity: `SavedRouteEntity`
+Stores complete multi-waypoint itineraries that users want to repeat.
 
-#### 3.2 Refactor Telemetry Calculation (`startRideTimer`)
-- **Eliminate unlabeled fabricated power figures**:
-  - Replace `motorPowerWatts = (speed * 10)` and `riderPowerWatts = (speed * 6)`.
-  - In **Normal Bike Mode**:
-    - `motorPowerWatts = 0`
-    - `batteryTelemetry = null`
-    - `riderPowerWatts`: If shown, calculated via physical aerodynamic/rolling drag mechanical equation ($P_{\text{mech}} = F_{\text{total}} \cdot v$) and explicitly labeled as an estimated physics calculation, or set to 0 when stationary.
-  - In **E-Bike Mode**:
-    - Use segment physics demand: calculate instantaneous mechanical power from road slope and current speed, split between motor and rider according to `activeAssist`.
-    - Mark telemetry explicitly as `isPowerEstimated = true`.
+```kotlin
+package com.ebike.router.data.local.entity
 
----
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+import com.ebike.router.model.RoutingProfile
 
-### Phase 4: Settings & Configuration UI
+@Entity(tableName = "saved_routes")
+data class SavedRouteEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val name: String,                           // e.g. "Caminho do Trabalho (Ciclovia)"
+    val profile: RoutingProfile,                // EFFICIENT, TURBO, SCENIC, SAFE
+    val waypointsJson: String,                  // Serialized List<RouteWaypoint>
+    val polylineJson: String,                   // Serialized List<GeoPoint> for immediate rendering
+    val totalDistanceMeters: Int,
+    val totalDurationSeconds: Int,
+    val elevationGainM: Int,
+    val isFavorite: Boolean = true,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
 
-#### 4.1 Create `ui/components/SettingsDialog.kt`
-Create a dedicated Material 3 Compose dialog containing:
-1. **Header**: "Configurações da Bicicleta" / "Bike Settings" with a close button.
-2. **Primary Opt-In Toggle**:
-   - `Switch` component: *"Tenho uma Bicicleta Elétrica (E-Bike)"*
-   - Subtitle: *"Desative para usar o aplicativo como ciclocomputador tradicional. Ative para estimativas de consumo de bateria e autonomia."*
-   - Default state: **OFF**.
-3. **Normal Bike Information Card (Shown when toggle is OFF)**:
-   - Icon: `Icons.Default.DirectionsBike`
-   - Text: *"Modo Bicicleta Convencional ativo. Suas rotas e estimativas de tempo são calculadas considerando pedalada humana sem assistência de motor. Métricas de bateria estão ocultas."*
-4. **E-Bike Specification Form (Shown only when toggle is ON)**:
-   - **Simulation Disclaimer Banner**:
-     ```
-     ⚠️ ESTIMATIVAS POR SIMULAÇÃO MATEMÁTICA
-     Este app não possui conexão Bluetooth (BLE) com a sua bicicleta.
-     Os números de autonomia, bateria e potência são calculados por
-     física simulada a partir das especificações informadas abaixo.
-     ```
-   - **Battery Capacity Input**:
-     - Number field: `Capacidade da Bateria (Wh)`
-     - Quick preset chips: `[250 Wh] [400 Wh] [500 Wh] [625 Wh] [750 Wh]`
-   - **Max Assist Speed**:
-     - Number field / selector: `Velocidade Máxima de Assistência (km/h)`
-     - Quick preset chips: `[25 km/h (UE)] [32 km/h (Brasil)] [45 km/h (Speed)]`
-   - **Bike Weight**:
-     - Number field: `Peso da Bicicleta (kg)` (e.g. default 24 kg)
-   - **Rider Weight + Cargo**:
-     - Number field: `Peso do Ciclista + Bagagem (kg)` (e.g. default 75 kg)
-   - **Current Battery Charge Level**:
-     - Slider: `Nível Atual da Bateria (%)` with live Wh equivalent display.
+### 3.3 Entity: `SavedDestinationEntity`
+Stores pinned destination points for rapid reuse in the search dialog and main map.
 
-#### 4.2 Entry Points in `MainActivity.kt`
-- Add a Settings button (Gear icon `Icons.Default.Settings`) to the floating top bar.
-- Manage dialog visibility state in `BikeMapViewModel`: `val showSettingsDialog = MutableStateFlow(false)`.
+```kotlin
+package com.ebike.router.data.local.entity
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+enum class DestinationCategory {
+    HOME, WORK, FAVORITE, TRAIL, POI
+}
+
+@Entity(tableName = "saved_destinations")
+data class SavedDestinationEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val label: String,                          // e.g. "Casa", "Trabalho", "Ciclovia Pinheiros"
+    val subText: String,                        // Address or descriptive text
+    val lat: Double,
+    val lng: Double,
+    val ele: Double = 20.0,
+    val category: DestinationCategory = DestinationCategory.FAVORITE,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
+
+### 3.4 Room Type Converters
+Using the existing Gson library (`com.google.code.gson:gson:2.11.0`):
+- `RoutingProfile` <-> `String`
+- `DestinationCategory` <-> `String`
+- `List<GeoPoint>` <-> `String` (JSON or Google Polyline Algorithm)
+- `List<RouteWaypoint>` <-> `String` (JSON)
 
 ---
 
-### Phase 5: Cockpit & Navigation HUD Overhauls
+## 4. DAO & Repository Layer Design
 
-#### 5.1 Update `ui/components/TelemetryCockpitDialog.kt`
-Add `isEBikeMode: Boolean` parameter.
+### 4.1 DAOs (`RideHistoryDao`, `SavedRouteDao`, `SavedDestinationDao`)
 
-##### Case A: Normal Bike Mode (`isEBikeMode == false`)
-- Header: *"Ciclocomputador de Bordo"* (Bike Computer).
-- **Speed Section**:
-  - Current Speed (large display), Average Speed, Max Speed.
-- **Trip Statistics Section**:
-  - Distance Ridden, Elapsed Time, Current Elevation, Total Elevation Gained.
-- **HIDDEN Components**:
-  - Completely hide the Motor Power (W) card.
-  - Completely hide the Battery Telemetry card (percentage, Wh, range, voltage).
-  - Completely hide the Assist Level selector buttons.
+```kotlin
+package com.ebike.router.data.local.dao
 
-##### Case B: E-Bike Mode (`isEBikeMode == true`)
-- **Prominent Top Disclaimer Badge**:
-  - Container: `Slate800` with amber/cyan border.
-  - Text: *"ESTIMATIVA POR FÍSICA SIMULADA • SEM CONEXÃO BLE"*.
-- **Power Section**:
-  - Title: *"POTÊNCIA ESTIMADA (CÁLCULO FÍSICO)"*.
-  - Motor card: `"${telemetry.motorPowerWatts} W (est.)"`, subtitle: *"Estimado via física"*.
-  - Rider card: `"${telemetry.riderPowerWatts} W (est.)"`, subtitle: *"Estimado nas pernas"*.
-- **Battery Section**:
-  - Title: *"ESTIMATIVA DE BATERIA"*
-  - Percentage: `"${battery.percentage}% est. (${battery.currentWh.toInt()} Wh)"`.
-  - Range: *"Autonomia estimada: ~${battery.estimatedRangeKm} km (estimado, não medido)"*.
-- **Assist Selector**:
-  - Title: *"NÍVEL DE ASSISTÊNCIA SIMULADO (ATÉ ${config.maxAssistSpeedKmh} KM/H)"*.
+import androidx.room.*
+import com.ebike.router.data.local.entity.*
+import kotlinx.coroutines.flow.Flow
 
-#### 5.2 Update `ui/components/NavigationHud.kt`
-Add `isEBikeMode: Boolean` parameter.
+@Dao
+interface RideHistoryDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRide(ride: RideHistoryEntity): Long
 
-##### Case A: Normal Bike Mode (`isEBikeMode == false`)
-- Top Instruction Banner: Unchanged (maneuver icon and distance).
-- Bottom Bar:
-  - **Left**: Speedometer (km/h) only. Remove the *"Assistência: ECO/TOUR"* subtitle.
-  - **Center**: Distance remaining and assist-free human ETA (*"Restante: X min"*).
-  - **Right**: Replace the battery percentage column with **Trip Elevation Gain** or **Average Speed** (e.g., `▲ 120m` or `Ø 21.4 km/h`).
+    @Query("UPDATE ride_history SET title = :newTitle WHERE id = :id")
+    suspend fun renameRide(id: Long, newTitle: String)
 
-##### Case B: E-Bike Mode (`isEBikeMode == true`)
-- Bottom Bar:
-  - **Left**: Speedometer + subtitle *"Assist: ${telemetry.activeAssist.name} (Simulado)"*.
-  - **Center**: Distance remaining and assist-aware ETA (*"Restante: X min (com motor)"*).
-  - **Right**:
-    - Percentage: `"${battery.percentage}%"`
-    - Subtitle: `"${battery.estimatedRangeKm} km est."`
-    - Small tag: *"estimado"*
+    @Delete
+    suspend fun deleteRide(ride: RideHistoryEntity)
+
+    @Query("DELETE FROM ride_history WHERE id = :id")
+    suspend fun deleteRideById(id: Long)
+
+    @Query("SELECT * FROM ride_history ORDER BY timestampMillis DESC")
+    fun getAllRides(): Flow<List<RideHistoryEntity>>
+
+    @Query("SELECT * FROM ride_history WHERE id = :id")
+    suspend fun getRideById(id: Long): RideHistoryEntity?
+}
+
+@Dao
+interface SavedRouteDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRoute(route: SavedRouteEntity): Long
+
+    @Query("UPDATE saved_routes SET name = :newName WHERE id = :id")
+    suspend fun renameRoute(id: Long, newName: String)
+
+    @Query("UPDATE saved_routes SET isFavorite = :isFav WHERE id = :id")
+    suspend fun setFavorite(id: Long, isFav: Boolean)
+
+    @Query("DELETE FROM saved_routes WHERE id = :id")
+    suspend fun deleteRouteById(id: Long)
+
+    @Query("SELECT * FROM saved_routes ORDER BY createdAtMillis DESC")
+    fun getAllSavedRoutes(): Flow<List<SavedRouteEntity>>
+}
+
+@Dao
+interface SavedDestinationDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDestination(destination: SavedDestinationEntity): Long
+
+    @Query("UPDATE saved_destinations SET label = :newLabel WHERE id = :id")
+    suspend fun renameDestination(id: Long, newLabel: String)
+
+    @Query("DELETE FROM saved_destinations WHERE id = :id")
+    suspend fun deleteDestinationById(id: Long)
+
+    @Query("SELECT * FROM saved_destinations ORDER BY createdAtMillis DESC")
+    fun getAllDestinations(): Flow<List<SavedDestinationEntity>>
+}
+```
+
+### 4.2 Room Database (`AppDatabase`)
+```kotlin
+@Database(
+    entities = [
+        RideHistoryEntity::class,
+        SavedRouteEntity::class,
+        SavedDestinationEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(RoomConverters::class)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun rideHistoryDao(): RideHistoryDao
+    abstract fun savedRouteDao(): SavedRouteDao
+    abstract fun savedDestinationDao(): SavedDestinationDao
+
+    companion object {
+        @Volatile private var INSTANCE: AppDatabase? = null
+        fun getInstance(context: Context): AppDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "bike_router.db"
+                ).build().also { INSTANCE = it }
+            }
+    }
+}
+```
+
+### 4.3 Repository Interface & Implementation (`BikeRepository`)
+A unified repository decoupling Room entities from UI ViewModels:
+- `val allRides: Flow<List<RideHistoryEntity>>`
+- `val savedRoutes: Flow<List<SavedRouteEntity>>`
+- `val savedDestinations: Flow<List<SavedDestinationEntity>>`
+- `suspend fun saveRide(ride: RideHistoryEntity): Long`
+- `suspend fun renameRide(id: Long, title: String)`
+- `suspend fun deleteRide(id: Long)`
+- `suspend fun saveRoute(name: String, route: RouteResult, waypoints: List<RouteWaypoint>): Long`
+- `suspend fun deleteRoute(id: Long)`
+- `suspend fun renameRoute(id: Long, newName: String)`
+- `suspend fun saveDestination(label: String, point: GeoPoint, address: String, category: DestinationCategory)`
+- `suspend fun deleteDestination(id: Long)`
 
 ---
 
-### Phase 6: Top Bar, Planner Sheet, & Map Overlays
+## 5. ViewModel Integration & State Machine Hooks
 
-#### 6.1 `MainActivity.kt` Top Bar Adaptations
-- **When E-Bike Mode is OFF**:
-  - Replace the Battery/Cockpit pill with a compact Stats/Settings pill or simply show the Settings gear button and a clean Cockpit button.
-  - Cyclists do not see an electric bike icon or battery level on their map screen.
-- **When E-Bike Mode is ON**:
-  - Show the Battery/Assist pill with an added `"EST."` badge to clarify it is an on-device estimate.
+`BikeMapViewModel` is the single source of truth for the map UI and navigation state. Below are the precise locations to hook save/load operations:
 
-#### 6.2 `RoutePlannerSheet.kt` Adaptations
-- **Header**:
-  - Off: *"Planejador de Rotas"* with badge `MULTI-PARADAS`.
-  - On: *"Planejador E-Bike"* with badge `SIMULAÇÃO E-BIKE`.
-- **Calculate Button**:
-  - Off: *"CALCULAR ROTA"* (`Icons.Default.DirectionsBike`).
-  - On: *"CALCULAR ROTA E-BIKE"* (`Icons.Default.ElectricBike`).
-- **Route Cards & Active Route Summary**:
-  - Off: Show distance, elevation gain, and standard cycling duration. Completely hide the `"-XX Wh"` and `"BATERIA (X%)"` cards.
-  - On: Show distance, assist-aware duration, and `"Bateria Est.: -XX Wh (XX%)"`.
+### 5.1 Repository Initialization
+In `BikeMapViewModel(application: Application)`:
+```kotlin
+private val database = AppDatabase.getInstance(application)
+val repository: BikeRepository = BikeRepositoryImpl(
+    database.rideHistoryDao(),
+    database.savedRouteDao(),
+    database.savedDestinationDao()
+)
 
-#### 6.3 `OsmdroidMapView.kt` Range Circle Overlay
-- When e-bike mode is OFF: Never draw the e-bike autonomy range circle.
-- When e-bike mode is ON: Draw estimated range circle around current GPS position if enabled in settings, labeled as estimated range radius.
+// Expose observable state flows to Compose UI
+val rideHistory = repository.allRides.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedRoutes = repository.savedRoutes.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedDestinations = repository.savedDestinations.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+```
+
+### 5.2 Hook 1: Ride Completion & Auto-Save Prompt
+Currently, in `BikeMapViewModel.kt`:
+- `handleRiderLocationUpdate` checks `if (distToManeuver <= 15)` on the last instruction and calls `stopNavigation()`.
+- `stopNavigation()` immediately sets `_isNavigating.value = false` and cancels `rideTimerJob`, discarding all telemetry.
+
+**Proposed Hook**:
+1. Introduce a state `val completedRideSummary = MutableStateFlow<RideHistoryEntity?>(null)`.
+2. Introduce a session start timestamp `rideStartTime: Long = 0L` initialized when `startNavigation()` is called.
+3. Update `stopNavigation(savePrompt: Boolean = true)`:
+   - Check if ride was substantive (e.g. `distanceRiddenKm >= 0.05` or `timeElapsedSeconds >= 20`) to avoid saving accidental 2-second clicks.
+   - If substantive and `savePrompt == true`:
+     - Construct a `RideHistoryEntity` from `telemetry.value` and `activeRoute.value`.
+     - Determine `isEBikeMode`: check whether motor assist was enabled (`activeAssist != AssistLevel.OFF`) or battery telemetry is active. For regular bike mode, set `energyConsumedWh = null` and `batteryDrainPercent = null`.
+     - Assign `completedRideSummary.value = summaryEntity`.
+     - This triggers a Compose dialog: "Pedal Finalizado! Deseja salvar?".
+     - If user clicks "Salvar", call `viewModelScope.launch { repository.saveRide(...) }`.
+     - If user clicks "Descartar", reset `completedRideSummary.value = null`.
+
+### 5.3 Hook 2: Saving the Active Route
+In `RoutePlannerSheet`:
+1. When `activeRoute.value != null`, the user can tap a "Salvar Rota" / Bookmark button.
+2. ViewModel method:
+```kotlin
+fun saveCurrentRoute(customName: String? = null) {
+    val route = activeRoute.value ?: return
+    val wps = _waypoints.value
+    viewModelScope.launch {
+        repository.saveRoute(
+            name = customName ?: route.name,
+            route = route,
+            waypoints = wps
+        )
+    }
+}
+```
+
+### 5.4 Hook 3: Loading a Saved Route
+When the user taps a saved route from the Saved Routes list:
+1. ViewModel method:
+```kotlin
+fun loadSavedRoute(savedRoute: SavedRouteEntity) {
+    val decodedWaypoints = deserializeWaypoints(savedRoute.waypointsJson)
+    _waypoints.value = decodedWaypoints
+    _selectedProfile.value = savedRoute.profile
+    showRoutePlannerSheet.value = true
+    calculateRoute() // Recalculate route for up-to-date traffic/profile
+}
+```
+
+### 5.5 Hook 4: Saving & Loading Favorite Destinations
+1. **In `WaypointSearchDialog`**:
+   - Above the search results or when query is blank, display `savedDestinations` chips ("🏠 Casa", "💼 Trabalho", "⭐ Favoritos").
+   - Tapping a chip immediately invokes `setWaypoint(targetIndex, destination.point, destination.label)` and dismisses the dialog.
+   - On search result items, add a Star/Bookmark icon: tapping it invokes `repository.saveDestination(...)`.
+2. **In Map Tap Dialog (`showMapClickMenuForPoint`)**:
+   - Add a "+ Salvar como Favorito" button to persist the tapped point.
 
 ---
 
-## 4. Verification & Testing Strategy
+## 6. UI Touchpoints & User Experience Flow
 
-### 4.1 Unit Testing Suite
-1. **`BikePreferencesRepositoryTest`**:
-   - Verify initial state defaults: `isEBikeMode == false`, `batteryCapacityWh == 500.0`, etc.
-   - Verify persistence across repository instances using an in-memory DataStore.
-   - Verify updating individual bike specs updates the emitted `UserBikePreferences`.
-2. **`EBikePhysicsEngineTest`**:
-   - Verify that with assist `OFF`, segment energy consumption is 0.0 Wh.
-   - Verify that speed calculation for normal bike slows down on steep inclines ($>6\%$).
-   - Verify that updating config with custom battery capacity (e.g. 750 Wh) and max assist speed (e.g. 25 km/h) appropriately scales the resulting range and duration estimates.
-3. **`BikeMapViewModelTest`**:
-   - Verify telemetry emission when `isEBikeMode == false`: `motorPowerWatts == 0`, `batteryTelemetry == null`.
-   - Verify telemetry emission when `isEBikeMode == true`: `batteryTelemetry != null`, `isPowerEstimated == true`.
-   - Verify route calculation uses assist-free speed parameters when e-bike mode is off.
+```
++-------------------------------------------------------------------------+
+| Top Bar: [ 🔍 Para onde vamos pedalar? ]  [ ⭐ Salvos & Histórico ] [ 🔋 90% ] |
++-------------------------------------------------------------------------+
+                                    |
+                                    v Opens
++-------------------------------------------------------------------------+
+|                  MODAL / SHEET: HISTÓRICO & SALVOS                      |
+|  [ TAB 1: HISTÓRICO ]   [ TAB 2: ROTAS SALVAS ]   [ TAB 3: FAVORITOS ]  |
+|                                                                         |
+|  • 17/09/2026 - Pedal Noturno (Normal Bike)                             |
+|    📏 14.2 km • ⏱️ 38 min • ⚡ 22.4 km/h • ▲ 120m                      |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
+|                                                                         |
+|  • 15/09/2026 - Rota Parque (E-Bike • ECO)                              |
+|    📏 28.5 km • ⏱️ 55 min • ⚡ 31.0 km/h • 🔋 -42 Wh (6.7%)            |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
++-------------------------------------------------------------------------+
+```
 
-### 4.2 UI & Component Testing
-1. **Compose Previews**:
-   - `SettingsDialogPreview` (both collapsed normal-bike state and expanded e-bike form).
-   - `TelemetryCockpitDialogPreview_NormalBike` vs `TelemetryCockpitDialogPreview_EBike`.
-   - `NavigationHudPreview_NormalBike` vs `NavigationHudPreview_EBike`.
-2. **Manual Functional Flow Verification**:
-   - **Scenario 1 (Fresh Install / Default)**: Launch app. Confirm no battery icon in top bar. Open route planner: confirm no Wh or battery labels. Start navigation: confirm no assist mode or battery percentage in HUD. Open Cockpit: confirm pure cycling computer stats without motor or battery sections.
-   - **Scenario 2 (Opt-In & Configuration)**: Tap Settings gear. Enable "Tenho uma Bicicleta Elétrica". Change battery capacity to 625 Wh, max speed to 32 km/h, bike weight to 26 kg. Verify disclaimer is prominent. Save settings.
-   - **Scenario 3 (E-Bike Navigation)**: Plan a route. Confirm assist-aware ETA and "-XX Wh est." are shown. Start simulation. Open HUD: confirm battery % has "est." label. Open Cockpit: confirm disclaimer "ESTIMATIVA POR FÍSICA SIMULADA - SEM CONEXÃO BLE" is visible, and motor/rider power are labeled as estimated.
-   - **Scenario 4 (Opt-Out / Normal Bike Reversion)**: Open Settings. Turn off "Tenho uma Bicicleta Elétrica". Confirm app instantly returns to normal bike mode without residual battery metrics.
+### 6.1 UI Entry Points
+1. **Top Bar in `MainActivity.kt`**:
+   - Insert an IconButton or Pill next to Search and Cockpit: `Icons.Default.Bookmark` / `Icons.Default.History` ("Histórico & Salvos").
+   - Controls state `showHistoryDialog: MutableStateFlow<Boolean>`.
+2. **Post-Ride Summary Dialog (`RideSummaryDialog`)**:
+   - Appears immediately upon arriving at the destination or ending navigation.
+   - Shows summary statistics card:
+     - Distance, duration, avg speed, elevation.
+     - Mode badge: "Bicicleta Convencional" vs "E-Bike (Tour/Eco)".
+   - Editable `OutlinedTextField` for custom ride title (prefilled with e.g. "Pedal em [Data]").
+   - Action buttons: "Salvar no Histórico" (EmeraldGreen) vs "Descartar" (Slate700).
+3. **History & Saved Sheet (`RideHistorySheet.kt`)**:
+   - **Tab 1: Histórico de Pedais**:
+     - `LazyColumn` of ride cards sorted by timestamp descending.
+     - Distinguishes standard bike vs e-bike visually.
+     - Swipe-to-delete or delete icon button with `ConfirmDeleteDialog`.
+     - Rename icon button opening `RenameDialog`.
+     - "Repetir no Mapa": loads the polyline on the map for viewing.
+   - **Tab 2: Rotas Salvas**:
+     - List of saved itineraries with profile tags, distance, and duration.
+     - "Navegar Agora": populates waypoints and opens planner.
+     - Rename / Delete options.
+   - **Tab 3: Locais Favoritos**:
+     - List of saved locations (Home, Work, custom).
+     - "Ir para cá": sets destination waypoint.
+4. **Integration into `WaypointSearchDialog.kt`**:
+   - Quick Favorites Row displayed when search query is empty.
+   - Bookmark icon on each search result item to save directly into favorites.
+5. **Integration into `RoutePlannerSheet.kt`**:
+   - A "Salvar Rota" button placed on the active route preview card.
 
 ---
 
-## 5. Risk Assessment & Mitigations
+## 7. Step-by-Step Implementation Roadmap
 
-| Risk | Impact | Mitigation Strategy |
+| Step | Scope | Description |
 | :--- | :--- | :--- |
-| **User Confusion / False Expectations** | Users assume the app connects to their e-bike via BLE and displays real battery state. | Place explicit disclaimers in Settings, Cockpit, and HUD: *"Sem conexão BLE • Valores estimados por simulação física"*. Avoid terms like "telemetria ao vivo" or "medido". |
-| **ETA Inaccuracy for Normal Bikes** | If physics engine continues using 25–32 km/h cruise speeds when e-bike mode is off, cyclists will receive impossibly optimistic ETAs on climbs. | Implement human pedaling power curve in `GraphRouterService` / `EBikePhysicsEngine` when e-bike mode is off, reducing uphill cruising speed based on physical grade. |
-| **DataStore Migration / Coroutine Lifecycle** | Asynchronous loading of DataStore preferences might cause a visual flicker from e-bike to normal bike on app startup. | Set initial state in ViewModel to `isEBikeMode = false` (safe default). Collect DataStore in `viewModelScope` with `SharingStarted.Eagerly`. |
-| **UI Clutter in Cockpit & HUD** | Adding disclaimers and badges might overwhelm smaller phone screens. | Use concise badges (`ESTIMADO`, `EST.`) with high-contrast Material 3 typography and place detailed explanations inside dialog tooltips or headers. |
+| **Phase 1** | Gradle Setup | Add KSP plugin to root and app `build.gradle.kts`, add `androidx.room` runtime, ktx, and compiler dependencies. |
+| **Phase 2** | Local Data Layer | Implement `RideHistoryEntity`, `SavedRouteEntity`, `SavedDestinationEntity`, Room type converters, DAOs, and `AppDatabase`. |
+| **Phase 3** | Repository Layer | Create `BikeRepository` interface and `BikeRepositoryImpl` managing coroutines on `Dispatchers.IO`. |
+| **Phase 4** | ViewModel Hooks | Inject repository into `BikeMapViewModel`. Wire navigation completion to `completedRideSummary`, add save/load/rename/delete methods. |
+| **Phase 5** | UI Components | Create `RideHistorySheet`, `RideSummaryDialog`, `RenameDialog`, and `ConfirmDeleteDialog`. |
+| **Phase 6** | Search & Planner UI | Integrate favorite destinations row into `WaypointSearchDialog` and "Salvar Rota" into `RoutePlannerSheet`. |
+| **Phase 7** | Verification | Test normal bike rides (no battery data saved), e-bike rides (battery data saved), database migrations, route loading, and deletion. |
+
+---
+
+## 8. Verification & Edge Cases
+
+1. **Normal Bike Mode Integrity**:
+   - Verify that rides performed with regular bike settings have `isEBikeMode = false` and `energyConsumedWh = null`, ensuring the UI cleanly hides battery cards.
+2. **Zero-Distance / Accidental Clicks**:
+   - Guard `completedRideSummary` against short aborts (< 50 meters or < 15 seconds) so database is not polluted.
+3. **Database Versioning & Migration**:
+   - Initial version `version = 1`. If schema evolves, specify clean Room migrations or `fallbackToDestructiveMigration()` during development.
+4. **Polyline Compression**:
+   - Store polylines as Google Polyline Algorithm encoded strings (or serialized coordinate JSON) to avoid large payload overhead in SQLite.

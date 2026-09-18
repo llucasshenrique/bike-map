@@ -4,12 +4,29 @@ import android.content.Context
 import android.graphics.*
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.preference.PreferenceManager
+import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DarkMode
+import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.ebike.router.model.*
+import com.ebike.router.ui.theme.CyanGlow
+import com.ebike.router.ui.theme.Slate900
 import com.ebike.router.ui.viewmodel.BikeMapViewModel
 import org.osmdroid.config.Configuration
 import org.osmdroid.events.MapEventsReceiver
@@ -21,6 +38,35 @@ import org.osmdroid.views.MapView
 import org.osmdroid.views.overlay.MapEventsOverlay
 import org.osmdroid.views.overlay.Marker
 import org.osmdroid.views.overlay.Polyline
+import java.io.File
+
+/**
+ * Night-mode tile filter: inverts tile luminance, then desaturates and dims the
+ * result so inverted hues (e.g. green roads) read as muted dark tones instead
+ * of jarring inverted colors, approximating a dark map style over MAPNIK tiles.
+ */
+private val nightTileColorFilter: ColorMatrixColorFilter by lazy {
+    val invert = ColorMatrix(
+        floatArrayOf(
+            -1f, 0f, 0f, 0f, 255f,
+            0f, -1f, 0f, 0f, 255f,
+            0f, 0f, -1f, 0f, 255f,
+            0f, 0f, 0f, 1f, 0f
+        )
+    )
+    val desaturate = ColorMatrix().apply { setSaturation(0.30f) }
+    val dim = ColorMatrix(
+        floatArrayOf(
+            0.8f, 0f, 0f, 0f, 0f,
+            0f, 0.8f, 0f, 0f, 0f,
+            0f, 0f, 0.8f, 0f, 0f,
+            0f, 0f, 0f, 1f, 0f
+        )
+    )
+    invert.postConcat(desaturate)
+    invert.postConcat(dim)
+    ColorMatrixColorFilter(invert)
+}
 
 @Composable
 fun OsmdroidMapView(
@@ -41,172 +87,241 @@ fun OsmdroidMapView(
 
     var mapViewRef by remember { mutableStateOf<MapView?>(null) }
     var riderMarker by remember { mutableStateOf<Marker?>(null) }
+    val systemInDarkTheme = isSystemInDarkTheme()
+    var isDarkMapTiles by remember { mutableStateOf(systemInDarkTheme) }
 
     DisposableEffect(Unit) {
-        Configuration.getInstance().userAgentValue = "EBikeRouterAndroid/1.0"
+        val prefs = PreferenceManager.getDefaultSharedPreferences(context)
+        Configuration.getInstance().load(context, prefs)
+        Configuration.getInstance().apply {
+            userAgentValue = "EBikeRouterAndroid/1.0"
+            // App-private, no storage permission needed, survives app restarts.
+            osmdroidBasePath = File(context.filesDir, "osmdroid")
+            osmdroidTileCache = File(osmdroidBasePath, "tiles")
+            tileFileSystemCacheMaxBytes = 500L * 1024 * 1024
+            tileFileSystemCacheTrimBytes = 400L * 1024 * 1024
+            // Serve cached tiles immediately offline instead of waiting on a timed-out
+            // network revalidation per tile.
+            expirationOverrideDuration = 30L * 24 * 60 * 60 * 1000
+        }
         onDispose {
+            viewModel.offlineTileCacheService.cancelDownload()
             mapViewRef?.onDetach()
         }
     }
 
-    AndroidView(
-        modifier = modifier.fillMaxSize(),
-        factory = { ctx ->
-            MapView(ctx).apply {
-                setTileSource(TileSourceFactory.MAPNIK)
-                setMultiTouchControls(true)
-                zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
-                isTilesScaledToDpi = true
+    // Region pre-download requested from the route planner: executed here because
+    // CacheManager needs a live, attached MapView to validate the tile source policy.
+    val offlineDownloadRequest by viewModel.offlineDownloadRequest.collectAsState()
+    LaunchedEffect(offlineDownloadRequest) {
+        val route = offlineDownloadRequest ?: return@LaunchedEffect
+        val map = mapViewRef
+        if (map == null) {
+            viewModel.onOfflineDownloadFinished(false)
+            return@LaunchedEffect
+        }
+        val bbox = viewModel.offlineTileCacheService.boundingBoxForRoute(route.coordinates)
+        if (bbox == null) {
+            viewModel.onOfflineDownloadFinished(false)
+            return@LaunchedEffect
+        }
+        try {
+            viewModel.offlineTileCacheService.downloadRegion(
+                context = context,
+                mapView = map,
+                bbox = bbox,
+                onProgress = { downloaded, total -> viewModel.onOfflineDownloadProgress(downloaded, total) },
+                onDone = { success -> viewModel.onOfflineDownloadFinished(success) }
+            )
+        } catch (e: Exception) {
+            viewModel.onOfflineDownloadFinished(false)
+        }
+    }
 
-                controller.setZoom(15.0)
-                controller.setCenter(OsmGeoPoint(-23.5505, -46.6333)) // Default
+    Box(modifier = modifier.fillMaxSize()) {
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                MapView(ctx).apply {
+                    setTileSource(TileSourceFactory.MAPNIK)
+                    overlayManager.tilesOverlay.setColorFilter(
+                        if (isDarkMapTiles) nightTileColorFilter else null
+                    )
+                    setMultiTouchControls(true)
+                    zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
+                    isTilesScaledToDpi = true
 
-                // Map Click Listener
-                val eventsOverlay = MapEventsOverlay(object : MapEventsReceiver {
-                    override fun singleTapConfirmedHelper(p: OsmGeoPoint?): Boolean {
-                        if (p != null) {
-                            val clicked = GeoPoint(p.latitude, p.longitude, 20.0)
-                            if (activePickingIdx != null) {
-                                viewModel.setWaypoint(activePickingIdx!!, clicked)
-                            } else {
-                                onMapClick(clicked)
-                            }
-                        }
-                        return true
-                    }
+                    controller.setZoom(15.0)
+                    controller.setCenter(OsmGeoPoint(-23.5505, -46.6333)) // Default
 
-                    override fun longPressHelper(p: OsmGeoPoint?): Boolean = false
-                })
-                overlays.add(0, eventsOverlay)
-
-                mapViewRef = this
-            }
-        },
-        update = { map ->
-            // Clear route overlays & markers (except click overlay at 0)
-            while (map.overlays.size > 1) {
-                map.overlays.removeAt(map.overlays.size - 1)
-            }
-
-            // 1. Draw Alternative Routes
-            availableRoutes.forEachIndexed { idx, altRoute ->
-                if (idx != selectedRouteIdx) {
-                    val pts = altRoute.coordinates.map { OsmGeoPoint(it.lat, it.lng) }
-                    val poly = Polyline(map).apply {
-                        setPoints(pts)
-                        outlinePaint.color = Color.DKGRAY
-                        outlinePaint.strokeWidth = 10f
-                        outlinePaint.strokeCap = Paint.Cap.ROUND
-                        outlinePaint.pathEffect = DashPathEffect(floatArrayOf(20f, 20f), 0f)
-                        setOnClickListener { _, _, _ ->
-                            viewModel.selectRoute(idx)
-                            true
-                        }
-                    }
-                    map.overlays.add(poly)
-                }
-            }
-
-            // 2. Draw Active Route with Elevation Grade Colors
-            activeRoute?.let { route ->
-                val allPts = route.coordinates.map { OsmGeoPoint(it.lat, it.lng) }
-
-                // Outer casing
-                val casing = Polyline(map).apply {
-                    setPoints(allPts)
-                    outlinePaint.color = Color.parseColor("#38BDF8")
-                    outlinePaint.strokeWidth = 16f
-                    outlinePaint.alpha = 80
-                    outlinePaint.strokeCap = Paint.Cap.ROUND
-                }
-                map.overlays.add(casing)
-
-                // Colored Segments
-                if (route.segments.isNotEmpty()) {
-                    route.segments.forEach { seg ->
-                        if (seg.coordinates.size >= 2) {
-                            val segPts = seg.coordinates.map { OsmGeoPoint(it.lat, it.lng) }
-                            val color = when {
-                                seg.gradePercent < 0.0 -> Color.parseColor("#06B6D4") // Downhill
-                                seg.gradePercent <= 3.0 -> Color.parseColor("#10B981") // Flat
-                                seg.gradePercent <= 7.0 -> Color.parseColor("#F59E0B") // Moderate
-                                else -> Color.parseColor("#EF4444") // Steep
-                            }
-                            val segPoly = Polyline(map).apply {
-                                setPoints(segPts)
-                                outlinePaint.color = color
-                                outlinePaint.strokeWidth = 12f
-                                outlinePaint.strokeCap = Paint.Cap.ROUND
-                            }
-                            map.overlays.add(segPoly)
-                        }
-                    }
-                } else {
-                    val activePoly = Polyline(map).apply {
-                        setPoints(allPts)
-                        outlinePaint.color = Color.parseColor("#0284C7")
-                        outlinePaint.strokeWidth = 12f
-                        outlinePaint.strokeCap = Paint.Cap.ROUND
-                    }
-                    map.overlays.add(activePoly)
-                }
-            }
-
-            // 3. Draw Waypoint Markers (A, B, C...)
-            waypoints.forEachIndexed { idx, wp ->
-                wp.point?.let { pt ->
-                    val isFirst = idx == 0
-                    val isLast = idx == waypoints.size - 1
-                    val bgColor = if (isFirst) "#10B981" else if (isLast) "#EF4444" else "#F59E0B"
-
-                    val marker = Marker(map).apply {
-                        position = OsmGeoPoint(pt.lat, pt.lng)
-                        icon = createPinDrawable(context, wp.letter, Color.parseColor(bgColor))
-                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
-                        title = wp.label
-                        isDraggable = true
-                        setOnMarkerDragListener(object : Marker.OnMarkerDragListener {
-                            override fun onMarkerDrag(m: Marker?) {}
-                            override fun onMarkerDragStart(m: Marker?) {}
-                            override fun onMarkerDragEnd(m: Marker?) {
-                                m?.position?.let { p ->
-                                    viewModel.setWaypoint(idx, GeoPoint(p.latitude, p.longitude, 20.0))
+                    // Map Click Listener
+                    val eventsOverlay = MapEventsOverlay(object : MapEventsReceiver {
+                        override fun singleTapConfirmedHelper(p: OsmGeoPoint?): Boolean {
+                            if (p != null) {
+                                val clicked = GeoPoint(p.latitude, p.longitude, 20.0)
+                                if (activePickingIdx != null) {
+                                    viewModel.setWaypoint(activePickingIdx!!, clicked)
+                                } else {
+                                    onMapClick(clicked)
                                 }
                             }
-                        })
+                            return true
+                        }
+
+                        override fun longPressHelper(p: OsmGeoPoint?): Boolean = false
+                    })
+                    overlays.add(0, eventsOverlay)
+
+                    mapViewRef = this
+                }
+            },
+            update = { map ->
+                // React to manual/system dark-map-tile toggle
+                map.overlayManager.tilesOverlay.setColorFilter(
+                    if (isDarkMapTiles) nightTileColorFilter else null
+                )
+
+                // Clear route overlays & markers (except click overlay at 0)
+                while (map.overlays.size > 1) {
+                    map.overlays.removeAt(map.overlays.size - 1)
+                }
+
+                // 1. Draw Alternative Routes
+                availableRoutes.forEachIndexed { idx, altRoute ->
+                    if (idx != selectedRouteIdx) {
+                        val pts = altRoute.coordinates.map { OsmGeoPoint(it.lat, it.lng) }
+                        val poly = Polyline(map).apply {
+                            setPoints(pts)
+                            outlinePaint.color = Color.DKGRAY
+                            outlinePaint.strokeWidth = 10f
+                            outlinePaint.strokeCap = Paint.Cap.ROUND
+                            outlinePaint.pathEffect = DashPathEffect(floatArrayOf(20f, 20f), 0f)
+                            setOnClickListener { _, _, _ ->
+                                viewModel.selectRoute(idx)
+                                true
+                            }
+                        }
+                        map.overlays.add(poly)
                     }
-                    map.overlays.add(marker)
                 }
-            }
 
-            // 4. Draw Rider Position Marker
-            val riderPt = OsmGeoPoint(locationState.point.lat, locationState.point.lng)
+                // 2. Draw Active Route with Elevation Grade Colors
+                activeRoute?.let { route ->
+                    val allPts = route.coordinates.map { OsmGeoPoint(it.lat, it.lng) }
 
-            // 5. Draw Estimated Range Circle (Only in E-Bike Mode)
-            val bat = telemetry.batteryTelemetry
-            if (isEBike && showRangeCircle && bat != null && bat.estimatedRangeKm > 0.0) {
-                val circle = org.osmdroid.views.overlay.Polygon(map).apply {
-                    points = org.osmdroid.views.overlay.Polygon.pointsAsCircle(riderPt, bat.estimatedRangeKm * 1000.0)
-                    fillPaint.color = Color.argb(20, 6, 182, 212)
-                    outlinePaint.color = Color.argb(80, 6, 182, 212)
-                    outlinePaint.strokeWidth = 3f
-                    title = "Autonomia Estimada: ~${bat.estimatedRangeKm} km"
+                    // Outer casing
+                    val casing = Polyline(map).apply {
+                        setPoints(allPts)
+                        outlinePaint.color = Color.parseColor("#38BDF8")
+                        outlinePaint.strokeWidth = 16f
+                        outlinePaint.alpha = 80
+                        outlinePaint.strokeCap = Paint.Cap.ROUND
+                    }
+                    map.overlays.add(casing)
+
+                    // Colored Segments
+                    if (route.segments.isNotEmpty()) {
+                        route.segments.forEach { seg ->
+                            if (seg.coordinates.size >= 2) {
+                                val segPts = seg.coordinates.map { OsmGeoPoint(it.lat, it.lng) }
+                                val color = when {
+                                    seg.gradePercent < 0.0 -> Color.parseColor("#06B6D4") // Downhill
+                                    seg.gradePercent <= 3.0 -> Color.parseColor("#10B981") // Flat
+                                    seg.gradePercent <= 7.0 -> Color.parseColor("#F59E0B") // Moderate
+                                    else -> Color.parseColor("#EF4444") // Steep
+                                }
+                                val segPoly = Polyline(map).apply {
+                                    setPoints(segPts)
+                                    outlinePaint.color = color
+                                    outlinePaint.strokeWidth = 12f
+                                    outlinePaint.strokeCap = Paint.Cap.ROUND
+                                }
+                                map.overlays.add(segPoly)
+                            }
+                        }
+                    } else {
+                        val activePoly = Polyline(map).apply {
+                            setPoints(allPts)
+                            outlinePaint.color = Color.parseColor("#0284C7")
+                            outlinePaint.strokeWidth = 12f
+                            outlinePaint.strokeCap = Paint.Cap.ROUND
+                        }
+                        map.overlays.add(activePoly)
+                    }
                 }
-                map.overlays.add(circle)
-            }
 
-            val rider = Marker(map).apply {
-                position = riderPt
-                icon = createRiderDrawable(context)
-                setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
-                rotation = locationState.headingDegrees
-            }
-            map.overlays.add(rider)
-            riderMarker = rider
+                // 3. Draw Waypoint Markers (A, B, C...)
+                waypoints.forEachIndexed { idx, wp ->
+                    wp.point?.let { pt ->
+                        val isFirst = idx == 0
+                        val isLast = idx == waypoints.size - 1
+                        val bgColor = if (isFirst) "#10B981" else if (isLast) "#EF4444" else "#F59E0B"
 
-            map.invalidate()
+                        val marker = Marker(map).apply {
+                            position = OsmGeoPoint(pt.lat, pt.lng)
+                            icon = createPinDrawable(context, wp.letter, Color.parseColor(bgColor))
+                            setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                            title = wp.label
+                            isDraggable = true
+                            setOnMarkerDragListener(object : Marker.OnMarkerDragListener {
+                                override fun onMarkerDrag(m: Marker?) {}
+                                override fun onMarkerDragStart(m: Marker?) {}
+                                override fun onMarkerDragEnd(m: Marker?) {
+                                    m?.position?.let { p ->
+                                        viewModel.setWaypoint(idx, GeoPoint(p.latitude, p.longitude, 20.0))
+                                    }
+                                }
+                            })
+                        }
+                        map.overlays.add(marker)
+                    }
+                }
+
+                // 4. Draw Rider Position Marker
+                val riderPt = OsmGeoPoint(locationState.point.lat, locationState.point.lng)
+
+                // 5. Draw Estimated Range Circle (Only in E-Bike Mode)
+                val bat = telemetry.batteryTelemetry
+                if (isEBike && showRangeCircle && bat != null && bat.estimatedRangeKm > 0.0) {
+                    val circle = org.osmdroid.views.overlay.Polygon(map).apply {
+                        points = org.osmdroid.views.overlay.Polygon.pointsAsCircle(riderPt, bat.estimatedRangeKm * 1000.0)
+                        fillPaint.color = Color.argb(20, 6, 182, 212)
+                        outlinePaint.color = Color.argb(80, 6, 182, 212)
+                        outlinePaint.strokeWidth = 3f
+                        title = "Autonomia Estimada: ~${bat.estimatedRangeKm} km"
+                    }
+                    map.overlays.add(circle)
+                }
+
+                val rider = Marker(map).apply {
+                    position = riderPt
+                    icon = createRiderDrawable(context)
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    rotation = locationState.headingDegrees
+                }
+                map.overlays.add(rider)
+                riderMarker = rider
+
+                map.invalidate()
+            }
+        )
+
+        IconButton(
+            onClick = { isDarkMapTiles = !isDarkMapTiles },
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(16.dp)
+                .size(40.dp)
+                .clip(CircleShape)
+                .background(Slate900.copy(alpha = 0.9f))
+        ) {
+            Icon(
+                imageVector = if (isDarkMapTiles) Icons.Default.LightMode else Icons.Default.DarkMode,
+                contentDescription = if (isDarkMapTiles) "Usar mapa claro" else "Usar mapa escuro",
+                tint = CyanGlow
+            )
         }
-    )
+    }
 
     val recenterEvent by viewModel.recenterEvent.collectAsState()
     var hasCenteredInitially by remember { mutableStateOf(false) }
