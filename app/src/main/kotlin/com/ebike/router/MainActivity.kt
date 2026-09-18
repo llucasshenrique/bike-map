@@ -1,7 +1,9 @@
 package com.ebike.router
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -28,6 +30,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import kotlin.math.max
+import com.ebike.router.service.LocationTrackerService
 import com.ebike.router.ui.components.*
 import com.ebike.router.ui.theme.*
 import com.ebike.router.ui.viewmodel.BikeMapViewModel
@@ -38,16 +41,17 @@ class MainActivity : ComponentActivity() {
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-            permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        ) {
-            viewModel.locationTracker.startTracking()
+        val fineGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
+        val coarseGranted = permissions[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+
+        if (fineGranted || coarseGranted) {
+            startAndBindTrackerService()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        checkLocationPermissions()
+        checkAndRequestPermissions()
 
         setContent {
             EBikeMapTheme {
@@ -56,21 +60,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun checkLocationPermissions() {
-        val fineLocationGranted = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-
-        if (!fineLocationGranted) {
-            requestPermissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
-                )
-            )
-        } else {
-            viewModel.locationTracker.startTracking()
+    private fun checkAndRequestPermissions() {
+        val permissionsToRequest = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissionsToRequest.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+
+        val missing = permissionsToRequest.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isNotEmpty()) {
+            requestPermissionLauncher.launch(missing.toTypedArray())
+        } else {
+            startAndBindTrackerService()
+        }
+    }
+
+    private fun startAndBindTrackerService() {
+        val serviceIntent = Intent(this, LocationTrackerService::class.java).apply {
+            action = LocationTrackerService.ACTION_START_TRACKING
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+        viewModel.bindService(this)
     }
 }
 
@@ -87,6 +102,12 @@ fun MainScreen(viewModel: BikeMapViewModel) {
     val activeRoute by viewModel.activeRoute.collectAsState()
     val telemetry by viewModel.telemetry.collectAsState()
     val waypoints by viewModel.waypoints.collectAsState()
+
+    val showHistorySheet by viewModel.showHistorySheet.collectAsState()
+    val completedRideSummary by viewModel.completedRideSummary.collectAsState()
+    val rideHistory by viewModel.rideHistory.collectAsState()
+    val savedRoutes by viewModel.savedRoutes.collectAsState()
+    val savedDestinations by viewModel.savedDestinations.collectAsState()
 
     var showMapClickMenuForPoint by remember { mutableStateOf<com.ebike.router.model.GeoPoint?>(null) }
 
@@ -133,6 +154,31 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium,
                             maxLines = 1
+                        )
+                    }
+                }
+
+                // History & Saved Pill
+                Surface(
+                    modifier = Modifier
+                        .height(48.dp)
+                        .clickable { viewModel.showHistorySheet.value = true },
+                    shape = RoundedCornerShape(24.dp),
+                    color = Slate900.copy(alpha = 0.95f),
+                    shadowElevation = 8.dp,
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Slate700)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Default.Bookmark, contentDescription = "Salvos & Histórico", tint = AmberWarning, modifier = Modifier.size(18.dp))
+                        Text(
+                            text = "Salvos",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
                         )
                     }
                 }
@@ -229,7 +275,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                 isMuted = viewModel.audioGuidance.isMuted,
                 isRerouting = isRerouting,
                 onToggleMute = {
-                    viewModel.audioGuidance.isMuted = !viewModel.audioGuidance.isMuted
+                    viewModel.setAudioMuted(!viewModel.audioGuidance.isMuted)
                 },
                 onStopNavigation = { viewModel.stopNavigation() },
                 onOpenCockpit = { viewModel.showCockpitDialog.value = true }
@@ -370,6 +416,7 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                     onSelectRoute = { viewModel.selectRoute(it) },
                     onStartNavigation = { viewModel.startNavigation(it) },
                     onStartSimulation = { viewModel.startSimulation(2) },
+                    onSaveRoute = { viewModel.saveCurrentRoute() },
                     onClose = { viewModel.showRoutePlannerSheet.value = false }
                 )
             }
@@ -418,6 +465,19 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                         ) {
                             Text("Destino")
                         }
+                        Button(
+                            onClick = {
+                                viewModel.saveDestination(
+                                    label = "Ponto Marcado",
+                                    point = clickedPt,
+                                    address = "${(clickedPt.lat * 1000).toInt() / 1000.0}, ${(clickedPt.lng * 1000).toInt() / 1000.0}"
+                                )
+                                showMapClickMenuForPoint = null
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = CyanPrimary, contentColor = Slate950)
+                        ) {
+                            Text("★ Salvar")
+                        }
                     }
                 },
                 containerColor = Slate900
@@ -435,11 +495,48 @@ fun MainScreen(viewModel: BikeMapViewModel) {
                 onSearch = { viewModel.searchPlaces(it) },
                 onSelectResult = { viewModel.selectSearchResult(targetIdx, it) },
                 onUseGps = { viewModel.useGpsForWaypoint(targetIdx) },
+                savedDestinations = savedDestinations,
+                onSelectSavedDestination = { viewModel.selectDestinationAsWaypoint(targetIdx, it) },
+                onSaveSearchResultAsFavorite = { viewModel.saveDestination(it.name, it.point, it.subText) },
                 onDismiss = { viewModel.showSearchDialogForIndex.value = null }
             )
         }
 
-        // 9. COCKPIT DIALOG
+        // 9. RIDE HISTORY & SAVED ROUTES SHEET
+        if (showHistorySheet) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+                RideHistorySheet(
+                    rides = rideHistory,
+                    savedRoutes = savedRoutes,
+                    savedDestinations = savedDestinations,
+                    onPreviewRide = { viewModel.previewRideOnMap(it) },
+                    onRenameRide = { id, name -> viewModel.renameRide(id, name) },
+                    onDeleteRide = { viewModel.deleteRide(it) },
+                    onLoadRoute = { viewModel.loadSavedRoute(it) },
+                    onRenameRoute = { id, name -> viewModel.renameSavedRoute(id, name) },
+                    onDeleteRoute = { viewModel.deleteSavedRoute(it) },
+                    onSelectDestination = {
+                        val targetIdx = max(1, waypoints.size - 1)
+                        viewModel.selectDestinationAsWaypoint(targetIdx, it)
+                        viewModel.showHistorySheet.value = false
+                    },
+                    onRenameDestination = { id, name -> viewModel.renameDestination(id, name) },
+                    onDeleteDestination = { viewModel.deleteDestination(it) },
+                    onClose = { viewModel.showHistorySheet.value = false }
+                )
+            }
+        }
+
+        // 10. POST-RIDE SUMMARY DIALOG
+        completedRideSummary?.let { ride ->
+            RideSummaryDialog(
+                ride = ride,
+                onSave = { customTitle -> viewModel.saveCompletedRide(customTitle) },
+                onDiscard = { viewModel.discardCompletedRide() }
+            )
+        }
+
+        // 11. COCKPIT DIALOG
         if (showCockpit) {
             TelemetryCockpitDialog(
                 telemetry = telemetry,

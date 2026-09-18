@@ -1,192 +1,429 @@
-# Off-Route Detection & Automatic Rerouting — Implementation Plan
+# Implementation Plan: Ride History & Saved/Favorite Routes Persistence
 
-## Current state (as read)
+## 1. Executive Summary & Architecture Philosophy
 
-- `GraphRouterService.calculateMultipleRoutes()` is called once, on demand
-  (`BikeMapViewModel.calculateRoute()`), when waypoints/profile change. Nothing
-  calls it again once navigation starts.
-- `BikeMapViewModel.handleRiderLocationUpdate()` (called from the
-  `locationTracker.locationState` collector in `init {}`) only tracks progress
-  *along the current instruction list* — it compares the rider's position to
-  `currentManeuver.point` to advance `_currentInstructionIndex`. It never
-  checks distance to the route polyline itself, so a rider who leaves the
-  route entirely keeps "navigating" a route they're no longer on; the next
-  maneuver's `distToManeuver` just grows without bound.
-- `RouteResult.coordinates: List<GeoPoint>` is the full route polyline (built
-  in `GraphRouterService.parseSingleRoute`/`buildDirectRoute`), already
-  available on `activeRoute.value`. This is the natural basis for deviation
-  distance — checking against it directly is more robust than checking
-  against per-maneuver points, since maneuver points are turn locations, not
-  a dense path.
-- `NavigationHud` is a pure display component (turn card + telemetry bar); it
-  has no rerouting affordance and doesn't need deep changes, just a way to
-  reflect "recalculating" state and optionally show a toast/banner.
-- `GeoPoint.distanceTo(other)` already exists (haversine, presumably) and is
-  used throughout — reuse it, don't add a new distance primitive.
+The application (`com.ebike.router`) is an Android Kotlin/Jetpack Compose navigation and routing app. Its primary architecture philosophy is **normal-bike-first**, featuring an **opt-in e-bike mode** (with battery drain modeling, assist level scaling, and motor wattage physics).
 
-## Design
+Currently, the app has **zero local persistence** — no Room, DataStore, or SharedPreferences. If the user closes the app or finishes a ride, all route computations, waypoints, and ride telemetry disappear immediately.
 
-### 1. Deviation-distance algorithm
+This document outlines a production-ready implementation plan to introduce local database persistence using **Jetpack Room** and **Kotlin Coroutines / Flow**, covering:
+1. **Ride History Persistence**: Logging completed rides (distance, duration, avg/max speed, elevation gain/loss, polyline path, and optional e-bike metrics).
+2. **Saved / Favorite Routes**: Storing multi-stop itineraries with profile preference, waypoints, and polyline previews.
+3. **Saved / Favorite Destinations**: Storing frequent places (Home, Work, Trails) for 1-tap waypoint selection in search dialogs.
 
-Add a pure function (e.g. in a new small file
-`app/src/main/kotlin/com/ebike/router/navigation/RouteDeviation.kt`, no
-Android/service dependencies so it's trivially unit-testable) that computes
-the rider's perpendicular distance to the route polyline:
+---
 
-```
-fun distanceToRoute(point: GeoPoint, routeCoordinates: List<GeoPoint>): Double
+## 2. Dependencies & Build Configuration (`build.gradle.kts`)
+
+### 2.1 Root `build.gradle.kts`
+Add the Kotlin Symbol Processing (KSP) plugin matching Kotlin `2.0.21`:
+```kotlin
+plugins {
+    id("com.android.application") version "8.7.3" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+    id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+}
 ```
 
-Implementation approach:
-- Iterate consecutive coordinate pairs `(a, b)` in `routeCoordinates`.
-- For each segment, project `point` onto the segment using planar
-  equirectangular approximation (routes are short enough — a few km — that
-  flat-earth projection around the segment's local latitude is accurate to
-  well under a meter of error, and is far cheaper than proper great-circle
-  cross-track math). Clamp the projection parameter `t` to `[0, 1]` so the
-  closest point is constrained to the segment, not the infinite line.
-- Compute the haversine distance (via existing `GeoPoint.distanceTo`) from
-  `point` to that clamped closest point on the segment.
-- Track the minimum distance across all segments and return it.
-- To avoid O(n) full-polyline scans on every GPS tick (routes can have
-  hundreds of coordinates from OSRM), restrict the search to a window
-  around the rider's current progress index rather than the whole polyline:
-  - Track `lastMatchedCoordIndex` (nearest polyline index found on the
-    previous tick).
-  - Search only `[lastMatchedCoordIndex - WINDOW, lastMatchedCoordIndex +
-    WINDOW]` (e.g. `WINDOW = 30` points) first; only fall back to a full
-    scan if nothing in the window is within a generous distance (handles
-    the case where the rider teleports/GPS jumps, or where progress
-    tracking desyncs).
-  - This state (`lastMatchedCoordIndex`) can live in the ViewModel next to
-    `_currentInstructionIndex`, reset whenever a new route becomes active.
+### 2.2 `app/build.gradle.kts`
+Apply the KSP plugin and add Room dependencies:
+```kotlin
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.devtools.ksp")
+}
 
-### 2. Debounce / hysteresis to avoid false triggers
+dependencies {
+    // Existing:
+    // ...
+    // implementation("com.google.code.gson:gson:2.11.0")
 
-Off-route detection must resist normal GPS noise, brief signal loss, tunnel
-crossings, and getting off the bike to walk it through pedestrian-only
-segments. Use two independent guards:
+    // Room Persistence
+    val roomVersion = "2.6.1"
+    implementation("androidx.room:room-runtime:$roomVersion")
+    implementation("androidx.room:room-ktx:$roomVersion")
+    ksp("androidx.room:room-compiler:$roomVersion")
+}
+```
 
-- **Distance threshold.** Off-route candidate when
-  `distanceToRoute(point, route.coordinates) > OFF_ROUTE_THRESHOLD_METERS`.
-  Recommend `OFF_ROUTE_THRESHOLD_METERS = 35.0` — generous enough to absorb
-  typical smartphone GPS error (5-20 m) plus minor lane/path offset, tight
-  enough to catch a genuine wrong turn onto a parallel street quickly.
-  Optionally scale it with `locationState.accuracyMeters` (e.g.
-  `max(35.0, accuracyMeters * 2.5)`) since `RiderLocationState.accuracyMeters`
-  is already tracked in `LocationTrackerService` — this prevents false
-  triggers when the fix is degraded (e.g. under tree cover).
-- **Sustained-duration debounce (hysteresis).** A single over-threshold
-  sample must not trigger a reroute (GPS jump artifacts are common — note
-  `LocationTrackerService` already special-cases noisy speed samples for the
-  same reason). Require the deviation to persist:
-  - Track `offRouteSinceMillis: Long?` in the ViewModel. On the first sample
-    exceeding the threshold, set it to `now`. On each subsequent sample: if
-    still over threshold and `now - offRouteSinceMillis >=
-    OFF_ROUTE_CONFIRM_MS` (recommend **6000 ms**, i.e. ~3-6 consecutive GPS
-    fixes at the 1s update interval), fire the reroute. If a sample comes
-    back under threshold before the debounce window elapses, reset
-    `offRouteSinceMillis = null` (rider was momentarily noisy, not actually
-    off-route).
-  - Additionally require a minimum number of consecutive over-threshold
-    samples (e.g. 3) rather than pure wall-clock time, since
-    `locationState` updates aren't perfectly periodic (min interval 500ms,
-    target 1000ms) — combining both guards (time AND consecutive-sample
-    count) is cheap and removes edge cases where a burst of fast updates
-    could trigger on transient noise within the time window.
-- **Cooldown after a reroute.** After a reroute is triggered and a new route
-  is loaded, suppress off-route re-evaluation for a short cooldown (e.g. 5s)
-  to let the rider's position stabilize against the *new* polyline and avoid
-  immediately re-triggering while the fresh route is still being fetched.
-- **Only evaluate while actually navigating.** Gate all of this behind
-  `_isNavigating.value == true` and `activeRoute.value != null`, mirroring
-  the existing guard at the top of `handleRiderLocationUpdate`.
+---
 
-### 3. Triggering GraphRouterService recompute
+## 3. Data Model & Room Entities
 
-When the debounced check fires:
+To respect the **normal-bike-first** principle, all e-bike-specific telemetry fields (such as `energyConsumedWh`, `batteryDrainPercent`, and `assistLevel`) are **nullable**. When a rider completes a regular bike ride, e-bike metrics are `null`, avoiding artificial zero-battery entries.
 
-1. Set a new state flag, e.g. `_isRerouting: StateFlow<Boolean>` (exposed for
-   UI, see below), to `true`.
-2. Call `routerService.calculateMultipleRoutes(points, profile)` with
-   `points = listOf(currentRiderGeoPoint) + remainingOriginalWaypoints`
-   (i.e. current GPS fix as new origin, keep the original destination/
-   waypoints after the rider's current leg — for a simple A→B route this is
-   just `listOf(currentPoint, destinationPoint)`). This reuses the exact
-   same method the initial route uses, from `viewModelScope.launch`, same as
-   `calculateRoute()`.
-3. On success: take the first result (or best-ranked, matching
-   `selectRoute(0)` behavior), assign it to `activeRoute.value`, reset
-   `_currentInstructionIndex.value = 0`, `_currentInstruction.value =
-   newRoute.instructions.firstOrNull()`, reset `lastMatchedCoordIndex` and
-   `offRouteSinceMillis`, and speak a guidance line via
-   `audioGuidance.speak("Recalculando rota...", true)` before the call and
-   `audioGuidance.speak(newInstruction.text, true)` after, mirroring the
-   existing `startNavigation` pattern.
-4. On failure/empty result (network down, matches the existing
-   try/fallback behavior in `GraphRouterService.calculateMultipleRoutes`,
-   which already falls back to `buildDirectRoute` so it practically always
-   returns *something*): keep navigating the stale route rather than
-   clearing it, and only retry off-route detection after the normal
-   debounce cycle runs again (don't hot-loop retries).
-5. Set `_isRerouting.value = false` in a `finally` block, symmetric to how
-   `_isCalculating` is handled in `calculateRoute()`.
-6. Concurrency guard: if a reroute is already in flight
-   (`_isRerouting.value == true`), skip triggering another one even if the
-   debounce condition re-fires (e.g. `handleRiderLocationUpdate` continues
-   to receive GPS ticks while the network call is pending).
+### 3.1 Entity: `RideHistoryEntity`
+Stores completed or recorded rides.
 
-This logic slots into `handleRiderLocationUpdate` (or a new private method
-`checkOffRouteAndReroute(point)` called from it) in `BikeMapViewModel.kt`,
-right after the existing maneuver-advance logic, guarded by
-`_isNavigating.value`.
+```kotlin
+package com.ebike.router.data.local.entity
 
-### 4. UI feedback (NavigationHud)
+import androidx.room.Entity
+import androidx.room.PrimaryKey
 
-- Add an `isRerouting: Boolean` parameter to `NavigationHud`, sourced from
-  the new `_isRerouting` StateFlow, and show a small inline state on the top
-  instruction card (e.g. replace the maneuver text temporarily with
-  "Recalculando rota..." plus a small `CircularProgressIndicator`, reusing
-  the same animated-progress pattern already introduced for the splash
-  screen per the recent commit history). This requires no structural
-  change to the card, just a conditional branch in the existing `Column`
-  that already renders `instruction?.text`.
-- No changes needed to the bottom telemetry bar or buttons.
+@Entity(tableName = "ride_history")
+data class RideHistoryEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val title: String,                          // e.g. "Pedal Matinal", "Parque Ibirapuera", or custom name
+    val timestampMillis: Long,                  // Start timestamp (System.currentTimeMillis())
+    val distanceMeters: Int,                    // Total distance traveled
+    val durationSeconds: Int,                   // Total elapsed active ride time
+    val avgSpeedKmh: Double,                    // Calculated average speed
+    val maxSpeedKmh: Double,                    // Peak speed recorded
+    val elevationGainM: Int,                    // Total meters climbed
+    val elevationLossM: Int,                    // Total meters descended
+    val routePolyline: String,                  // JSON array or Encoded Polyline (GeoPoint list)
+    val startAddress: String? = null,           // Human-readable origin label
+    val endAddress: String? = null,             // Human-readable destination label
+    
+    // Normal-bike-first vs E-bike opt-in attributes:
+    val isEBikeMode: Boolean = false,           // False for regular acoustic bikes, true if e-bike mode was used
+    val assistLevel: String? = null,            // AssistLevel name (OFF, ECO, TOUR, SPORT, TURBO) or null
+    val energyConsumedWh: Double? = null,       // Wh consumed during ride (null if standard bike)
+    val batteryDrainPercent: Double? = null     // Percentage drain (null if standard bike)
+)
+```
 
-### 5. State/reset bookkeeping
+### 3.2 Entity: `SavedRouteEntity`
+Stores complete multi-waypoint itineraries that users want to repeat.
 
-- Reset `offRouteSinceMillis`, `lastMatchedCoordIndex`, and consecutive
-  over-threshold counters whenever: `startNavigation()` is called (fresh
-  route), `stopNavigation()` is called, or a reroute completes successfully
-  (step 3 above). This avoids stale debounce state leaking across
-  navigation sessions or across route swaps.
+```kotlin
+package com.ebike.router.data.local.entity
 
-## Suggested file-level changes (for the follow-up implementation task)
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+import com.ebike.router.model.RoutingProfile
 
-1. **New file** `navigation/RouteDeviation.kt` — pure `distanceToRoute()` +
-   windowed nearest-segment search, unit-testable without Android
-   dependencies.
-2. **`BikeMapViewModel.kt`**:
-   - New private state: `lastMatchedCoordIndex`, `offRouteSinceMillis`,
-     `consecutiveOffRouteSamples`.
-   - New public `_isRerouting` StateFlow.
-   - New private `checkOffRouteAndReroute(point: GeoPoint)` invoked from
-     `handleRiderLocationUpdate`.
-   - Reset logic added to `startNavigation()` / `stopNavigation()`.
-3. **`NavigationHud.kt`**: add `isRerouting` param + conditional UI branch.
-4. **Tests**: unit tests for `RouteDeviation.distanceToRoute` covering
-   on-route, near-threshold, and off-route cases with a synthetic polyline
-   (no emulator/instrumentation needed since the function is pure).
+@Entity(tableName = "saved_routes")
+data class SavedRouteEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val name: String,                           // e.g. "Caminho do Trabalho (Ciclovia)"
+    val profile: RoutingProfile,                // EFFICIENT, TURBO, SCENIC, SAFE
+    val waypointsJson: String,                  // Serialized List<RouteWaypoint>
+    val polylineJson: String,                   // Serialized List<GeoPoint> for immediate rendering
+    val totalDistanceMeters: Int,
+    val totalDurationSeconds: Int,
+    val elevationGainM: Int,
+    val isFavorite: Boolean = true,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
 
-## Constants to tune during implementation
+### 3.3 Entity: `SavedDestinationEntity`
+Stores pinned destination points for rapid reuse in the search dialog and main map.
 
-| Constant | Suggested value | Rationale |
-|---|---|---|
-| `OFF_ROUTE_THRESHOLD_METERS` | 35.0 (or `max(35, accuracy*2.5)`) | Absorbs GPS noise, catches real deviation |
-| `OFF_ROUTE_CONFIRM_MS` | 6000 | ~3-6 GPS samples of sustained deviation |
-| `MIN_CONSECUTIVE_OFF_SAMPLES` | 3 | Belt-and-suspenders against update-rate jitter |
-| `REROUTE_COOLDOWN_MS` | 5000 | Let new route stabilize before re-evaluating |
-| `POLYLINE_SEARCH_WINDOW` | 30 points | Bound per-tick cost on long polylines |
+```kotlin
+package com.ebike.router.data.local.entity
 
-No code was written; this file only records the investigation and proposed
-approach for a follow-up implementation pass.
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+
+enum class DestinationCategory {
+    HOME, WORK, FAVORITE, TRAIL, POI
+}
+
+@Entity(tableName = "saved_destinations")
+data class SavedDestinationEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    val label: String,                          // e.g. "Casa", "Trabalho", "Ciclovia Pinheiros"
+    val subText: String,                        // Address or descriptive text
+    val lat: Double,
+    val lng: Double,
+    val ele: Double = 20.0,
+    val category: DestinationCategory = DestinationCategory.FAVORITE,
+    val createdAtMillis: Long = System.currentTimeMillis()
+)
+```
+
+### 3.4 Room Type Converters
+Using the existing Gson library (`com.google.code.gson:gson:2.11.0`):
+- `RoutingProfile` <-> `String`
+- `DestinationCategory` <-> `String`
+- `List<GeoPoint>` <-> `String` (JSON or Google Polyline Algorithm)
+- `List<RouteWaypoint>` <-> `String` (JSON)
+
+---
+
+## 4. DAO & Repository Layer Design
+
+### 4.1 DAOs (`RideHistoryDao`, `SavedRouteDao`, `SavedDestinationDao`)
+
+```kotlin
+package com.ebike.router.data.local.dao
+
+import androidx.room.*
+import com.ebike.router.data.local.entity.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface RideHistoryDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRide(ride: RideHistoryEntity): Long
+
+    @Query("UPDATE ride_history SET title = :newTitle WHERE id = :id")
+    suspend fun renameRide(id: Long, newTitle: String)
+
+    @Delete
+    suspend fun deleteRide(ride: RideHistoryEntity)
+
+    @Query("DELETE FROM ride_history WHERE id = :id")
+    suspend fun deleteRideById(id: Long)
+
+    @Query("SELECT * FROM ride_history ORDER BY timestampMillis DESC")
+    fun getAllRides(): Flow<List<RideHistoryEntity>>
+
+    @Query("SELECT * FROM ride_history WHERE id = :id")
+    suspend fun getRideById(id: Long): RideHistoryEntity?
+}
+
+@Dao
+interface SavedRouteDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRoute(route: SavedRouteEntity): Long
+
+    @Query("UPDATE saved_routes SET name = :newName WHERE id = :id")
+    suspend fun renameRoute(id: Long, newName: String)
+
+    @Query("UPDATE saved_routes SET isFavorite = :isFav WHERE id = :id")
+    suspend fun setFavorite(id: Long, isFav: Boolean)
+
+    @Query("DELETE FROM saved_routes WHERE id = :id")
+    suspend fun deleteRouteById(id: Long)
+
+    @Query("SELECT * FROM saved_routes ORDER BY createdAtMillis DESC")
+    fun getAllSavedRoutes(): Flow<List<SavedRouteEntity>>
+}
+
+@Dao
+interface SavedDestinationDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDestination(destination: SavedDestinationEntity): Long
+
+    @Query("UPDATE saved_destinations SET label = :newLabel WHERE id = :id")
+    suspend fun renameDestination(id: Long, newLabel: String)
+
+    @Query("DELETE FROM saved_destinations WHERE id = :id")
+    suspend fun deleteDestinationById(id: Long)
+
+    @Query("SELECT * FROM saved_destinations ORDER BY createdAtMillis DESC")
+    fun getAllDestinations(): Flow<List<SavedDestinationEntity>>
+}
+```
+
+### 4.2 Room Database (`AppDatabase`)
+```kotlin
+@Database(
+    entities = [
+        RideHistoryEntity::class,
+        SavedRouteEntity::class,
+        SavedDestinationEntity::class
+    ],
+    version = 1,
+    exportSchema = false
+)
+@TypeConverters(RoomConverters::class)
+abstract class AppDatabase : RoomDatabase() {
+    abstract fun rideHistoryDao(): RideHistoryDao
+    abstract fun savedRouteDao(): SavedRouteDao
+    abstract fun savedDestinationDao(): SavedDestinationDao
+
+    companion object {
+        @Volatile private var INSTANCE: AppDatabase? = null
+        fun getInstance(context: Context): AppDatabase =
+            INSTANCE ?: synchronized(this) {
+                INSTANCE ?: Room.databaseBuilder(
+                    context.applicationContext,
+                    AppDatabase::class.java,
+                    "bike_router.db"
+                ).build().also { INSTANCE = it }
+            }
+    }
+}
+```
+
+### 4.3 Repository Interface & Implementation (`BikeRepository`)
+A unified repository decoupling Room entities from UI ViewModels:
+- `val allRides: Flow<List<RideHistoryEntity>>`
+- `val savedRoutes: Flow<List<SavedRouteEntity>>`
+- `val savedDestinations: Flow<List<SavedDestinationEntity>>`
+- `suspend fun saveRide(ride: RideHistoryEntity): Long`
+- `suspend fun renameRide(id: Long, title: String)`
+- `suspend fun deleteRide(id: Long)`
+- `suspend fun saveRoute(name: String, route: RouteResult, waypoints: List<RouteWaypoint>): Long`
+- `suspend fun deleteRoute(id: Long)`
+- `suspend fun renameRoute(id: Long, newName: String)`
+- `suspend fun saveDestination(label: String, point: GeoPoint, address: String, category: DestinationCategory)`
+- `suspend fun deleteDestination(id: Long)`
+
+---
+
+## 5. ViewModel Integration & State Machine Hooks
+
+`BikeMapViewModel` is the single source of truth for the map UI and navigation state. Below are the precise locations to hook save/load operations:
+
+### 5.1 Repository Initialization
+In `BikeMapViewModel(application: Application)`:
+```kotlin
+private val database = AppDatabase.getInstance(application)
+val repository: BikeRepository = BikeRepositoryImpl(
+    database.rideHistoryDao(),
+    database.savedRouteDao(),
+    database.savedDestinationDao()
+)
+
+// Expose observable state flows to Compose UI
+val rideHistory = repository.allRides.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedRoutes = repository.savedRoutes.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+val savedDestinations = repository.savedDestinations.stateIn(
+    viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList()
+)
+```
+
+### 5.2 Hook 1: Ride Completion & Auto-Save Prompt
+Currently, in `BikeMapViewModel.kt`:
+- `handleRiderLocationUpdate` checks `if (distToManeuver <= 15)` on the last instruction and calls `stopNavigation()`.
+- `stopNavigation()` immediately sets `_isNavigating.value = false` and cancels `rideTimerJob`, discarding all telemetry.
+
+**Proposed Hook**:
+1. Introduce a state `val completedRideSummary = MutableStateFlow<RideHistoryEntity?>(null)`.
+2. Introduce a session start timestamp `rideStartTime: Long = 0L` initialized when `startNavigation()` is called.
+3. Update `stopNavigation(savePrompt: Boolean = true)`:
+   - Check if ride was substantive (e.g. `distanceRiddenKm >= 0.05` or `timeElapsedSeconds >= 20`) to avoid saving accidental 2-second clicks.
+   - If substantive and `savePrompt == true`:
+     - Construct a `RideHistoryEntity` from `telemetry.value` and `activeRoute.value`.
+     - Determine `isEBikeMode`: check whether motor assist was enabled (`activeAssist != AssistLevel.OFF`) or battery telemetry is active. For regular bike mode, set `energyConsumedWh = null` and `batteryDrainPercent = null`.
+     - Assign `completedRideSummary.value = summaryEntity`.
+     - This triggers a Compose dialog: "Pedal Finalizado! Deseja salvar?".
+     - If user clicks "Salvar", call `viewModelScope.launch { repository.saveRide(...) }`.
+     - If user clicks "Descartar", reset `completedRideSummary.value = null`.
+
+### 5.3 Hook 2: Saving the Active Route
+In `RoutePlannerSheet`:
+1. When `activeRoute.value != null`, the user can tap a "Salvar Rota" / Bookmark button.
+2. ViewModel method:
+```kotlin
+fun saveCurrentRoute(customName: String? = null) {
+    val route = activeRoute.value ?: return
+    val wps = _waypoints.value
+    viewModelScope.launch {
+        repository.saveRoute(
+            name = customName ?: route.name,
+            route = route,
+            waypoints = wps
+        )
+    }
+}
+```
+
+### 5.4 Hook 3: Loading a Saved Route
+When the user taps a saved route from the Saved Routes list:
+1. ViewModel method:
+```kotlin
+fun loadSavedRoute(savedRoute: SavedRouteEntity) {
+    val decodedWaypoints = deserializeWaypoints(savedRoute.waypointsJson)
+    _waypoints.value = decodedWaypoints
+    _selectedProfile.value = savedRoute.profile
+    showRoutePlannerSheet.value = true
+    calculateRoute() // Recalculate route for up-to-date traffic/profile
+}
+```
+
+### 5.5 Hook 4: Saving & Loading Favorite Destinations
+1. **In `WaypointSearchDialog`**:
+   - Above the search results or when query is blank, display `savedDestinations` chips ("🏠 Casa", "💼 Trabalho", "⭐ Favoritos").
+   - Tapping a chip immediately invokes `setWaypoint(targetIndex, destination.point, destination.label)` and dismisses the dialog.
+   - On search result items, add a Star/Bookmark icon: tapping it invokes `repository.saveDestination(...)`.
+2. **In Map Tap Dialog (`showMapClickMenuForPoint`)**:
+   - Add a "+ Salvar como Favorito" button to persist the tapped point.
+
+---
+
+## 6. UI Touchpoints & User Experience Flow
+
+```
++-------------------------------------------------------------------------+
+| Top Bar: [ 🔍 Para onde vamos pedalar? ]  [ ⭐ Salvos & Histórico ] [ 🔋 90% ] |
++-------------------------------------------------------------------------+
+                                    |
+                                    v Opens
++-------------------------------------------------------------------------+
+|                  MODAL / SHEET: HISTÓRICO & SALVOS                      |
+|  [ TAB 1: HISTÓRICO ]   [ TAB 2: ROTAS SALVAS ]   [ TAB 3: FAVORITOS ]  |
+|                                                                         |
+|  • 17/09/2026 - Pedal Noturno (Normal Bike)                             |
+|    📏 14.2 km • ⏱️ 38 min • ⚡ 22.4 km/h • ▲ 120m                      |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
+|                                                                         |
+|  • 15/09/2026 - Rota Parque (E-Bike • ECO)                              |
+|    📏 28.5 km • ⏱️ 55 min • ⚡ 31.0 km/h • 🔋 -42 Wh (6.7%)            |
+|    [ ✏️ Renomear ] [ 🗑️ Excluir ] [ 🗺️ Ver Trajeto ]                   |
++-------------------------------------------------------------------------+
+```
+
+### 6.1 UI Entry Points
+1. **Top Bar in `MainActivity.kt`**:
+   - Insert an IconButton or Pill next to Search and Cockpit: `Icons.Default.Bookmark` / `Icons.Default.History` ("Histórico & Salvos").
+   - Controls state `showHistoryDialog: MutableStateFlow<Boolean>`.
+2. **Post-Ride Summary Dialog (`RideSummaryDialog`)**:
+   - Appears immediately upon arriving at the destination or ending navigation.
+   - Shows summary statistics card:
+     - Distance, duration, avg speed, elevation.
+     - Mode badge: "Bicicleta Convencional" vs "E-Bike (Tour/Eco)".
+   - Editable `OutlinedTextField` for custom ride title (prefilled with e.g. "Pedal em [Data]").
+   - Action buttons: "Salvar no Histórico" (EmeraldGreen) vs "Descartar" (Slate700).
+3. **History & Saved Sheet (`RideHistorySheet.kt`)**:
+   - **Tab 1: Histórico de Pedais**:
+     - `LazyColumn` of ride cards sorted by timestamp descending.
+     - Distinguishes standard bike vs e-bike visually.
+     - Swipe-to-delete or delete icon button with `ConfirmDeleteDialog`.
+     - Rename icon button opening `RenameDialog`.
+     - "Repetir no Mapa": loads the polyline on the map for viewing.
+   - **Tab 2: Rotas Salvas**:
+     - List of saved itineraries with profile tags, distance, and duration.
+     - "Navegar Agora": populates waypoints and opens planner.
+     - Rename / Delete options.
+   - **Tab 3: Locais Favoritos**:
+     - List of saved locations (Home, Work, custom).
+     - "Ir para cá": sets destination waypoint.
+4. **Integration into `WaypointSearchDialog.kt`**:
+   - Quick Favorites Row displayed when search query is empty.
+   - Bookmark icon on each search result item to save directly into favorites.
+5. **Integration into `RoutePlannerSheet.kt`**:
+   - A "Salvar Rota" button placed on the active route preview card.
+
+---
+
+## 7. Step-by-Step Implementation Roadmap
+
+| Step | Scope | Description |
+| :--- | :--- | :--- |
+| **Phase 1** | Gradle Setup | Add KSP plugin to root and app `build.gradle.kts`, add `androidx.room` runtime, ktx, and compiler dependencies. |
+| **Phase 2** | Local Data Layer | Implement `RideHistoryEntity`, `SavedRouteEntity`, `SavedDestinationEntity`, Room type converters, DAOs, and `AppDatabase`. |
+| **Phase 3** | Repository Layer | Create `BikeRepository` interface and `BikeRepositoryImpl` managing coroutines on `Dispatchers.IO`. |
+| **Phase 4** | ViewModel Hooks | Inject repository into `BikeMapViewModel`. Wire navigation completion to `completedRideSummary`, add save/load/rename/delete methods. |
+| **Phase 5** | UI Components | Create `RideHistorySheet`, `RideSummaryDialog`, `RenameDialog`, and `ConfirmDeleteDialog`. |
+| **Phase 6** | Search & Planner UI | Integrate favorite destinations row into `WaypointSearchDialog` and "Salvar Rota" into `RoutePlannerSheet`. |
+| **Phase 7** | Verification | Test normal bike rides (no battery data saved), e-bike rides (battery data saved), database migrations, route loading, and deletion. |
+
+---
+
+## 8. Verification & Edge Cases
+
+1. **Normal Bike Mode Integrity**:
+   - Verify that rides performed with regular bike settings have `isEBikeMode = false` and `energyConsumedWh = null`, ensuring the UI cleanly hides battery cards.
+2. **Zero-Distance / Accidental Clicks**:
+   - Guard `completedRideSummary` against short aborts (< 50 meters or < 15 seconds) so database is not polluted.
+3. **Database Versioning & Migration**:
+   - Initial version `version = 1`. If schema evolves, specify clean Room migrations or `fallbackToDestructiveMigration()` during development.
+4. **Polyline Compression**:
+   - Store polylines as Google Polyline Algorithm encoded strings (or serialized coordinate JSON) to avoid large payload overhead in SQLite.
