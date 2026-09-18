@@ -44,6 +44,7 @@ fun RoutePlannerSheet(
     onSelectRoute: (Int) -> Unit,
     onStartNavigation: (RouteResult) -> Unit,
     onStartSimulation: (RouteResult) -> Unit,
+    onSaveRoute: (() -> Unit)? = null,
     onClose: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -357,6 +358,22 @@ fun RoutePlannerSheet(
                 )
 
                 Spacer(modifier = Modifier.height(12.dp))
+
+                // Save Route Button
+                onSaveRoute?.let { saveAction ->
+                    OutlinedButton(
+                        onClick = saveAction,
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = AmberWarning),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, AmberWarning.copy(alpha = 0.6f))
+                    ) {
+                        Icon(Icons.Default.BookmarkAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Salvar Rota nos Favoritos", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
 
                 // Action Buttons
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
