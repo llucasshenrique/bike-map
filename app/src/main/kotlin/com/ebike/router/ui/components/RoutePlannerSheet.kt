@@ -187,6 +187,30 @@ fun RoutePlannerSheet(
                         // Actions
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             IconButton(
+                                onClick = { onMoveWaypoint(idx, idx - 1) },
+                                enabled = idx > 0,
+                                modifier = Modifier.size(32.dp).background(Slate700, RoundedCornerShape(6.dp))
+                            ) {
+                                Icon(
+                                    Icons.Default.KeyboardArrowUp,
+                                    contentDescription = "Mover para cima",
+                                    tint = if (idx > 0) Color.White else Slate700,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            IconButton(
+                                onClick = { onMoveWaypoint(idx, idx + 1) },
+                                enabled = idx < waypoints.size - 1,
+                                modifier = Modifier.size(32.dp).background(Slate700, RoundedCornerShape(6.dp))
+                            ) {
+                                Icon(
+                                    Icons.Default.KeyboardArrowDown,
+                                    contentDescription = "Mover para baixo",
+                                    tint = if (idx < waypoints.size - 1) Color.White else Slate700,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                            IconButton(
                                 onClick = { onPickOnMap(idx) },
                                 modifier = Modifier.size(32.dp).background(if (isPicking) CyanPrimary else Slate700, RoundedCornerShape(6.dp))
                             ) {
