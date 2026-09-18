@@ -17,6 +17,7 @@ import com.ebike.router.data.local.entity.SavedRouteEntity
 import com.ebike.router.data.repository.BikeRepository
 import com.ebike.router.data.repository.BikeRepositoryImpl
 import com.ebike.router.model.*
+import com.ebike.router.navigation.RouteDeviation
 import com.ebike.router.physics.EBikePhysicsEngine
 import com.ebike.router.service.AudioGuidanceService
 import com.ebike.router.service.GeocodingService
@@ -142,6 +143,15 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     private val _distanceToNextManeuverMeters = MutableStateFlow(0)
     val distanceToNextManeuverMeters: StateFlow<Int> = _distanceToNextManeuverMeters.asStateFlow()
 
+    // Off-route detection & automatic rerouting
+    private val _isRerouting = MutableStateFlow(false)
+    val isRerouting: StateFlow<Boolean> = _isRerouting.asStateFlow()
+
+    private var lastMatchedCoordIndex: Int? = null
+    private var offRouteSinceMillis: Long? = null
+    private var consecutiveOffRouteSamples: Int = 0
+    private var rerouteCooldownUntilMillis: Long = 0L
+
     // Live Telemetry
     private val _telemetry = MutableStateFlow(LiveRideTelemetry())
     val telemetry: StateFlow<LiveRideTelemetry> = _telemetry.asStateFlow()
@@ -190,6 +200,10 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
                     viewModelScope.launch {
                         s.locationState.collect { loc ->
                             _locationState.value = loc
+                            val r = activeRoute.value
+                            if (_isNavigating.value && r != null) {
+                                checkOffRouteAndReroute(loc.point, r)
+                            }
                         }
                     }
                     viewModelScope.launch {
@@ -399,6 +413,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         _currentInstructionIndex.value = 0
         _currentInstruction.value = targetRoute.instructions.firstOrNull()
         showRoutePlannerSheet.value = false
+        resetOffRouteTracking()
         rideStartTimeMillis = System.currentTimeMillis()
 
         _trackerService.value?.startNavigation(targetRoute)
@@ -420,6 +435,7 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         _isNavigating.value = false
         _trackerService.value?.stopNavigation()
         audioGuidance.speak("Navegação finalizada.")
+        resetOffRouteTracking()
 
         // Guard against accidental clicks: check if ride was substantive (>= 50m or >= 15s)
         val isSubstantive = distKm >= 0.05 || elapsed >= 15
@@ -602,6 +618,83 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
         _trackerService.value?.setAudioMuted(muted)
     }
 
+    private fun resetOffRouteTracking() {
+        lastMatchedCoordIndex = null
+        offRouteSinceMillis = null
+        consecutiveOffRouteSamples = 0
+        _isRerouting.value = false
+    }
+
+    // --- OFF-ROUTE DETECTION & AUTOMATIC REROUTING ---
+
+    private fun checkOffRouteAndReroute(point: GeoPoint, route: RouteResult) {
+        if (_isRerouting.value) return
+
+        val now = System.currentTimeMillis()
+        if (now < rerouteCooldownUntilMillis) return
+
+        val nearest = RouteDeviation.findNearestPointOnRoute(
+            point = point,
+            routeCoordinates = route.coordinates,
+            searchAroundIndex = lastMatchedCoordIndex
+        ) ?: return
+
+        lastMatchedCoordIndex = nearest.segmentIndex
+
+        val accuracyMeters = _locationState.value.accuracyMeters.toDouble()
+        val threshold = max(OFF_ROUTE_THRESHOLD_METERS, accuracyMeters * 2.5)
+
+        if (nearest.distanceMeters <= threshold) {
+            offRouteSinceMillis = null
+            consecutiveOffRouteSamples = 0
+            return
+        }
+
+        consecutiveOffRouteSamples++
+        if (offRouteSinceMillis == null) {
+            offRouteSinceMillis = now
+        }
+
+        val sustainedForMillis = now - (offRouteSinceMillis ?: now)
+        val isConfirmedOffRoute = sustainedForMillis >= OFF_ROUTE_CONFIRM_MS &&
+            consecutiveOffRouteSamples >= MIN_CONSECUTIVE_OFF_ROUTE_SAMPLES
+
+        if (isConfirmedOffRoute) {
+            triggerReroute(point, route)
+        }
+    }
+
+    private fun triggerReroute(fromPoint: GeoPoint, staleRoute: RouteResult) {
+        val destination = staleRoute.coordinates.lastOrNull() ?: return
+
+        _isRerouting.value = true
+        offRouteSinceMillis = null
+        consecutiveOffRouteSamples = 0
+
+        audioGuidance.speak("Você saiu da rota. Recalculando...", true)
+
+        viewModelScope.launch {
+            try {
+                val routes = routerService.calculateMultipleRoutes(
+                    listOf(fromPoint, destination),
+                    _selectedProfile.value
+                )
+                val newRoute = routes.firstOrNull()
+                if (newRoute != null) {
+                    activeRoute.value = newRoute
+                    _currentInstructionIndex.value = 0
+                    _currentInstruction.value = newRoute.instructions.firstOrNull()
+                    lastMatchedCoordIndex = null
+                    rerouteCooldownUntilMillis = System.currentTimeMillis() + REROUTE_COOLDOWN_MS
+                    _trackerService.value?.startNavigation(newRoute)
+                    audioGuidance.speak(newRoute.instructions.firstOrNull()?.text ?: "Nova rota calculada.", true)
+                }
+            } finally {
+                _isRerouting.value = false
+            }
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         serviceConnection?.let { conn ->
@@ -616,6 +709,10 @@ class BikeMapViewModel(application: Application) : AndroidViewModel(application)
     }
 
     companion object {
+        private const val OFF_ROUTE_THRESHOLD_METERS = 35.0
+        private const val OFF_ROUTE_CONFIRM_MS = 6000L
+        private const val MIN_CONSECUTIVE_OFF_ROUTE_SAMPLES = 3
+        private const val REROUTE_COOLDOWN_MS = 5000L
         private const val RECENT_SPEED_WINDOW = 12
 
         /**

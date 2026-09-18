@@ -266,12 +266,14 @@ fun MainScreen(viewModel: BikeMapViewModel) {
             // Full Turn-by-Turn HUD
             val curInstruction by viewModel.currentInstruction.collectAsState()
             val distToNextManeuver by viewModel.distanceToNextManeuverMeters.collectAsState()
+            val isRerouting by viewModel.isRerouting.collectAsState()
 
             NavigationHud(
                 instruction = curInstruction,
                 distanceToNextManeuverMeters = distToNextManeuver,
                 telemetry = telemetry,
                 isMuted = viewModel.audioGuidance.isMuted,
+                isRerouting = isRerouting,
                 onToggleMute = {
                     viewModel.setAudioMuted(!viewModel.audioGuidance.isMuted)
                 },
