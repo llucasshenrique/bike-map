@@ -1,11 +1,12 @@
 # Working on this repo
 
 This project is developed through **Orca-managed worktrees**, with multiple coding agents
-(`agy` / Antigravity CLI, `claude`, ...) working in parallel worktrees under
-`/home/llucasshenrique/orca/workspaces/bike-map/`, coordinated by a controlling agent (you)
-via the `orca` CLI. Load the `orca-cli` and `orchestration` skills at the start of any session
-that involves spawning, coordinating, or checking in on other agents in this repo — do not wait
-to be reminded.
+(`agy` / Antigravity CLI, `claude`, ...) working in parallel worktrees, coordinated by a
+controlling agent (you) via the `orca` CLI. Worktree locations are machine/Orca-config
+dependent — never hardcode a path to them; resolve with `orca worktree list --repo <selector>
+--json` or `orca worktree show --worktree <selector>` instead. Load the `orca-cli` and
+`orchestration` skills at the start of any session that involves spawning, coordinating, or
+checking in on other agents in this repo — do not wait to be reminded.
 
 ## Resolving the CLI
 
@@ -61,13 +62,15 @@ wrote the feature.
 
 ## Android build environment
 
-- SDK: `/home/llucasshenrique/Android/Sdk` — `export ANDROID_HOME=/home/llucasshenrique/Android/Sdk`
-  before running `./gradlew` outside of Orca's own tooling. `mise.toml` also declares
-  `android-cli`/`android-sdk` for reproducible setup.
-- **No Android emulator works in this sandbox** — `emulator -avd Pixel_10 ...` dies silently
-  ~15-20s into every boot attempt, with no OOM/kernel evidence found. Do not spend time trying
-  to fix this. Use **Paparazzi** instead (`app.cash.paparazzi` plugin, already applied to
-  `:app`) for any UI-visual change: `./gradlew :app:recordPaparazziDebug --tests "*YourTest*"`
+- SDK: managed via `mise.toml` (`android-cli`/`android-sdk` tools) for reproducible setup. If
+  `./gradlew` can't find the SDK outside Orca's own tooling, check `local.properties`/
+  `$ANDROID_HOME`/`$ANDROID_SDK_ROOT` for the actual local install path rather than assuming
+  one — it varies by machine.
+- **No Android emulator works in at least one known sandbox environment** — boots died silently
+  ~15-20s in, with no OOM/kernel evidence found. Don't sink time into an emulator before
+  confirming (quickly) whether it works on the current host. Prefer **Paparazzi** regardless
+  (`app.cash.paparazzi` plugin, already applied to `:app`) for any UI-visual change:
+  `./gradlew :app:recordPaparazziDebug --tests "*YourTest*"`
   renders Compose composables to PNG via a JVM-only layoutlib, no device needed. The user
   explicitly wants screenshots (or short recordings, where feasible) of UI changes so they can
   review without building/launching the app themselves — treat this as a standing requirement
